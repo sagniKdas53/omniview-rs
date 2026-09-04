@@ -6,7 +6,10 @@ use std::sync::Arc;
 
 
 use crate::cache::ThumbnailCache;
-use crate::clipboard::{copy_file_uri, copy_image_bitmap, copy_text, open_in_default_app, reveal_in_file_manager};
+use crate::clipboard::{
+    copy_file_uri, copy_files_uris, copy_image_bitmap, copy_multiple_paths,
+    copy_text, open_in_default_app, reveal_in_file_manager, start_drag_files,
+};
 use crate::scanner::{scan_directory, ImageEntry};
 use crate::watcher::FolderWatcher;
 
@@ -39,6 +42,10 @@ pub struct OmniViewApp {
     pub card_size: f32,
     pub dark_mode: bool,
 
+    // Batch Selection Mode
+    pub select_mode: bool,
+    pub selected_paths: HashSet<PathBuf>,
+
     // Caching & Async
     pub cache: Arc<ThumbnailCache>,
     pub textures: HashMap<PathBuf, TextureHandle>,
@@ -60,7 +67,6 @@ pub struct OmniViewApp {
 
     // Status
     pub total_bytes: u64,
-    
 }
 
 impl OmniViewApp {
@@ -81,6 +87,9 @@ impl OmniViewApp {
             card_size: 220.0,
             dark_mode: true,
 
+            select_mode: false,
+            selected_paths: HashSet::new(),
+
             cache,
             textures: HashMap::new(),
             pending_requests: HashSet::new(),
@@ -98,7 +107,6 @@ impl OmniViewApp {
             viewer_is_fit: true,
 
             total_bytes: 0,
-            
         };
 
         app.load_directory(initial_dir);
@@ -109,6 +117,7 @@ impl OmniViewApp {
         self.current_dir = dir.clone();
         self.textures.clear();
         self.pending_requests.clear();
+        self.selected_paths.clear();
         self.viewing_index = None;
         self.viewer_texture = None;
 
@@ -287,7 +296,9 @@ impl OmniViewApp {
                             if ui.button("📋 Copy Path").clicked() {
                                 copy_text(&entry.path.to_string_lossy());
                             }
-                            // Direct file copy / attachment button
+                            if ui.button("📤 Drag to Share").clicked() {
+                                start_drag_files(&[entry.path.clone()]);
+                            }
                             if ui.button("📁 Copy File (Attach)").clicked() {
                                 copy_file_uri(&entry.path);
                             }
@@ -473,6 +484,26 @@ impl eframe::App for OmniViewApp {
                     self.rescan();
                 }
 
+                // Batch Selection Toggle Button
+                let select_btn_text = if self.select_mode {
+                    format!("☑️ Selecting ({})", self.selected_paths.len())
+                } else {
+                    "☑️ Batch Select".to_string()
+                };
+                let select_color = if self.select_mode {
+                    Color32::from_rgb(0, 210, 255)
+                } else if self.dark_mode {
+                    Color32::from_rgb(220, 225, 235)
+                } else {
+                    Color32::from_rgb(30, 40, 55)
+                };
+                if ui.button(egui::RichText::new(select_btn_text).color(select_color).strong()).clicked() {
+                    self.select_mode = !self.select_mode;
+                    if !self.select_mode {
+                        self.selected_paths.clear();
+                    }
+                }
+
                 // Dark / Light Mode Toggle
                 let theme_icon = if self.dark_mode { "☀️ Light" } else { "🌙 Dark" };
                 if ui.button(theme_icon).clicked() {
@@ -499,7 +530,71 @@ impl eframe::App for OmniViewApp {
             ui.add_space(4.0);
         });
 
-        // 2. Left Sidebar (Subfolder Browser)
+        // 2. Batch Selection Bottom Action Bar (when active)
+        if self.select_mode || !self.selected_paths.is_empty() {
+            egui::TopBottomPanel::bottom("batch_panel")
+                .frame(
+                    egui::Frame::side_top_panel(ctx.style().as_ref())
+                        .fill(if self.dark_mode { Color32::from_rgb(15, 23, 42) } else { Color32::from_rgb(240, 245, 255) })
+                        .stroke(Stroke::new(1.0_f32, if self.dark_mode { Color32::from_rgb(30, 58, 138) } else { Color32::from_rgb(180, 200, 240) }))
+                )
+                .show(ctx, |ui| {
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing = Vec2::new(12.0, 0.0);
+
+                        let count = self.selected_paths.len();
+                        ui.label(
+                            egui::RichText::new(format!("📦 {} item(s) selected", count))
+                                .strong()
+                                .size(13.0)
+                                .color(if self.dark_mode { Color32::from_rgb(56, 189, 248) } else { Color32::from_rgb(2, 132, 199) }),
+                        );
+
+                        let selected_vec: Vec<PathBuf> = self.selected_paths.iter().cloned().collect();
+
+                        // Drag & Drop
+                        let drag_btn = ui.add_enabled(count > 0, egui::Button::new(format!("📤 Drag & Drop ({})", count)));
+                        if drag_btn.clicked() {
+                            start_drag_files(&selected_vec);
+                        }
+
+                        // Copy Files (Attach)
+                        let copy_files_btn = ui.add_enabled(count > 0, egui::Button::new("📁 Copy Files (Attach)"));
+                        if copy_files_btn.clicked() {
+                            copy_files_uris(&selected_vec);
+                        }
+
+                        // Copy Paths
+                        let copy_paths_btn = ui.add_enabled(count > 0, egui::Button::new("📋 Copy Paths"));
+                        if copy_paths_btn.clicked() {
+                            copy_multiple_paths(&selected_vec);
+                        }
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("✕ Exit Select Mode").clicked() {
+                                self.select_mode = false;
+                                self.selected_paths.clear();
+                            }
+
+                            if count > 0 && ui.button("Deselect All").clicked() {
+                                self.selected_paths.clear();
+                            }
+
+                            let filtered = self.get_filtered_indices();
+                            let total_filtered = filtered.len();
+                            if ui.button(format!("✓ Select All ({})", total_filtered)).clicked() {
+                                for &idx in &filtered {
+                                    self.selected_paths.insert(self.all_entries[idx].path.clone());
+                                }
+                            }
+                        });
+                    });
+                    ui.add_space(6.0);
+                });
+        }
+
+        // 3. Left Sidebar (Subfolder Browser)
         egui::SidePanel::left("subfolder_sidebar")
             .resizable(true)
             .default_width(220.0)
@@ -569,14 +664,42 @@ impl eframe::App for OmniViewApp {
                                         self.request_thumbnail(&entry);
                                     }
 
-                                    // Allocate interactive card rect with click sensing
+                                    let is_selected = self.selected_paths.contains(&entry.path);
+
+                                    // Allocate interactive card rect with click & drag sensing
                                     let (card_rect, card_resp) = ui.allocate_exact_size(
                                         Vec2::new(card_w, card_h),
-                                        egui::Sense::click(),
+                                        egui::Sense::click_and_drag(),
                                     );
 
-                                    // Single click or double click opens the Lightbox Viewer!
-                                    if card_resp.clicked() || card_resp.double_clicked() {
+                                    // Drag-and-drop initiation!
+                                    if card_resp.drag_started() {
+                                        if is_selected && self.selected_paths.len() > 1 {
+                                            let files: Vec<PathBuf> = self.selected_paths.iter().cloned().collect();
+                                            start_drag_files(&files);
+                                        } else {
+                                            start_drag_files(&[entry.path.clone()]);
+                                        }
+                                    }
+
+                                    // Click handling: toggle select if select mode or Ctrl, else open viewer
+                                    if card_resp.clicked() {
+                                        if self.select_mode || ui.input(|i| i.modifiers.command || i.modifiers.ctrl) {
+                                            if !self.select_mode {
+                                                self.select_mode = true;
+                                            }
+                                            if is_selected {
+                                                self.selected_paths.remove(&entry.path);
+                                            } else {
+                                                self.selected_paths.insert(entry.path.clone());
+                                            }
+                                        } else {
+                                            self.viewing_index = Some(item_idx_in_filtered);
+                                        }
+                                    }
+
+                                    // Double click opens Lightbox even in select mode
+                                    if card_resp.double_clicked() {
                                         self.viewing_index = Some(item_idx_in_filtered);
                                     }
 
@@ -586,13 +709,17 @@ impl eframe::App for OmniViewApp {
                                         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                                     }
 
-                                    let bg_color = if is_hovered {
+                                    let bg_color = if is_selected {
+                                        if self.dark_mode { Color32::from_rgb(18, 38, 62) } else { Color32::from_rgb(224, 242, 254) }
+                                    } else if is_hovered {
                                         if self.dark_mode { Color32::from_rgb(34, 40, 56) } else { Color32::from_rgb(235, 242, 252) }
                                     } else {
                                         if self.dark_mode { Color32::from_rgb(22, 25, 34) } else { Color32::from_rgb(248, 250, 252) }
                                     };
 
-                                    let stroke = if is_hovered {
+                                    let stroke = if is_selected {
+                                        Stroke::new(2.0_f32, Color32::from_rgb(0, 210, 255))
+                                    } else if is_hovered {
                                         Stroke::new(1.5_f32, if self.dark_mode { Color32::from_rgb(90, 160, 255) } else { Color32::from_rgb(40, 120, 230) })
                                     } else {
                                         Stroke::new(1.0_f32, if self.dark_mode { Color32::from_rgb(45, 50, 65) } else { Color32::from_rgb(220, 225, 235) })
@@ -628,6 +755,29 @@ impl eframe::App for OmniViewApp {
                                         );
                                     }
 
+                                    // Batch Selection Checkbox Indicator
+                                    if self.select_mode || is_selected {
+                                        let check_box_rect = Rect::from_min_size(card_rect.min + Vec2::new(8.0, 8.0), Vec2::new(20.0, 20.0));
+                                        if is_selected {
+                                            ui.painter().rect_filled(check_box_rect, CornerRadius::same(4), Color32::from_rgb(0, 180, 255));
+                                            ui.painter().text(
+                                                check_box_rect.center(),
+                                                egui::Align2::CENTER_CENTER,
+                                                "✓",
+                                                egui::FontId::proportional(13.0),
+                                                Color32::WHITE,
+                                            );
+                                        } else {
+                                            ui.painter().rect_filled(check_box_rect, CornerRadius::same(4), Color32::from_black_alpha(150));
+                                            ui.painter().rect_stroke(
+                                                check_box_rect,
+                                                CornerRadius::same(4),
+                                                Stroke::new(1.5_f32, Color32::from_white_alpha(200)),
+                                                egui::StrokeKind::Inside,
+                                            );
+                                        }
+                                    }
+
                                     // Filename label
                                     let text_color = if self.dark_mode { Color32::from_rgb(220, 225, 235) } else { Color32::from_rgb(30, 40, 55) };
                                     let text_pos = Pos2::new(card_rect.min.x + pad + 2.0, thumb_area.max.y + 4.0);
@@ -651,6 +801,26 @@ impl eframe::App for OmniViewApp {
                                     card_resp.context_menu(|ui| {
                                         if ui.button("🔍 Open in Viewer").clicked() {
                                             self.viewing_index = Some(item_idx_in_filtered);
+                                            ui.close_menu();
+                                        }
+                                        if ui.button("📤 Drag to Share / Attach").clicked() {
+                                            if is_selected && self.selected_paths.len() > 1 {
+                                                let files: Vec<PathBuf> = self.selected_paths.iter().cloned().collect();
+                                                start_drag_files(&files);
+                                            } else {
+                                                start_drag_files(&[entry.path.clone()]);
+                                            }
+                                            ui.close_menu();
+                                        }
+                                        if ui.button(if is_selected { "☑️ Deselect" } else { "☑️ Select" }).clicked() {
+                                            if !self.select_mode {
+                                                self.select_mode = true;
+                                            }
+                                            if is_selected {
+                                                self.selected_paths.remove(&entry.path);
+                                            } else {
+                                                self.selected_paths.insert(entry.path.clone());
+                                            }
                                             ui.close_menu();
                                         }
                                         ui.separator();
@@ -736,6 +906,8 @@ mod tests {
             sort_mode: SortMode::Newest,
             card_size: 220.0,
             dark_mode: true,
+            select_mode: false,
+            selected_paths: HashSet::new(),
             cache,
             textures: HashMap::new(),
             pending_requests: HashSet::new(),
@@ -839,5 +1011,37 @@ mod tests {
         app.sort_mode = SortMode::Oldest;
         let indices = app.get_filtered_indices();
         assert_eq!(app.all_entries[indices[0]].filename, "zeta.png"); // 100 secs ago
+    }
+
+    #[test]
+    fn test_batch_selection_logic() {
+        let mut app = create_test_app();
+        assert!(!app.select_mode);
+        assert_eq!(app.selected_paths.len(), 0);
+
+        // Turn on select mode
+        app.select_mode = true;
+
+        // Toggle select an item
+        let path1 = app.all_entries[0].path.clone();
+        app.selected_paths.insert(path1.clone());
+        assert_eq!(app.selected_paths.len(), 1);
+        assert!(app.selected_paths.contains(&path1));
+
+        // Select All filtered items
+        let filtered = app.get_filtered_indices();
+        for &idx in &filtered {
+            app.selected_paths.insert(app.all_entries[idx].path.clone());
+        }
+        assert_eq!(app.selected_paths.len(), 5);
+
+        // Deselect one item
+        app.selected_paths.remove(&path1);
+        assert_eq!(app.selected_paths.len(), 4);
+        assert!(!app.selected_paths.contains(&path1));
+
+        // Clear all
+        app.selected_paths.clear();
+        assert_eq!(app.selected_paths.len(), 0);
     }
 }

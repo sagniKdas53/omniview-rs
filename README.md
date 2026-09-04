@@ -14,11 +14,17 @@ Designed to effortlessly handle massive repositories (10,000+ files, 15+ GB) acr
 - **Live Folder Watching**: Uses the `notify` crate to watch your open directory. Whenever new images are added, renamed, or deleted, OmniView updates in real-time.
 - **Sensible Lightbox Fit Mode**: When opening images, OmniView calculates available screen dimensions and fits the image cleanly to 95% of your screen (never a tiny speck). Includes 1:1 original pixel toggle and mouse-wheel zoom.
 - **Dark / Light Mode**: Instant one-click toggle between sleek dark mode and bright light mode.
-- **Native Clipboard & Drag Integration**:
-  - `Copy File (Attach)`: Copies file URI (`file://`) to clipboard for immediate pasting in Discord, Slack, and Nautilus.
-  - `Copy Path`: Copies absolute path.
-  - `Copy Image`: Copies bitmap pixels.
+- **Native Drag-and-Drop & Clipboard Sharing**:
+  - **Drag to Share**: Click & drag any image card (or multiple selected images) straight out of OmniView and drop directly into **Discord**, **Slack**, **Telegram**, **Chrome**, or **Nautilus** file managers!
+  - `📤 Drag to Share` button in Lightbox and right-click context menu.
+  - `📁 Copy Files (Attach)`: Copies single or multi-file URIs (`file://`) to clipboard for instant attachment pasting.
+  - `📋 Copy Paths`: Copies single or multi-file newline-separated paths.
+  - `🖼️ Copy Image`: Copies raw bitmap pixels.
   - `Open in Default App` (`xdg-open`) and `Reveal in File Manager` (`nautilus --select`).
+- **Batch Selection Mode**:
+  - One-click toggle via top bar `☑️ Batch Select` or `Ctrl+Click` on any card.
+  - Checkboxes and glowing cyan borders on selected cards.
+  - Floating bottom action bar for multi-file Drag & Drop, Multi-file Attachment Copy, Multi-path Copy, Select All, and Clear.
 
 ---
 
@@ -48,10 +54,13 @@ omniview /path/to/manga_corpus
 
 | Action | Shortcut / Control |
 |---|---|
-| Open Lightbox Viewer | Double-click any card |
+| Open Lightbox Viewer | Click or Double-click any card |
+| Drag Image to Share | Click & Drag any card (or click `📤 Drag to Share`) |
+| Toggle Batch Select Mode | Click `☑️ Batch Select` in top bar |
+| Multi-Select Cards | Click card in select mode or `Ctrl + Click` |
 | Close Viewer | `Esc` |
 | Next / Previous Image | `Right` / `Left` Arrow keys |
-| Toggle Fit / 1:1 Actual Size | `Space` or Double-click |
+| Toggle Fit / 1:1 Actual Size | `Space` or Double-click in Lightbox |
 | Zoom In / Out | Mouse Wheel |
-| Pan Image | Click & Drag |
+| Pan Image | Click & Drag inside viewer |
 | Switch Folder | Click `📁 [Folder Name]` button |

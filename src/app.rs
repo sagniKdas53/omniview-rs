@@ -232,6 +232,7 @@ impl OmniViewApp {
         let Some(curr_idx) = self.viewing_index else { return };
         if curr_idx >= total_in_view {
             self.viewing_index = None;
+            self.viewer_texture = None;
             return;
         }
 
@@ -252,18 +253,54 @@ impl OmniViewApp {
             }
         }
 
-        // Fullscreen Overlay
-        egui::Area::new(egui::Id::new("lightbox_overlay"))
-            .fixed_pos(Pos2::ZERO)
-            .show(ctx, |ui| {
-                let screen_rect = ctx.screen_rect();
-                ui.painter().rect_filled(screen_rect, CornerRadius::ZERO, Color32::from_black_alpha(240));
+        let mut close_requested = false;
+        let mut nav_next = false;
+        let mut nav_prev = false;
+        let mut toggle_fit = false;
 
-                let mut top_rect = screen_rect;
-                top_rect.max.y = top_rect.min.y + 48.0;
+        let title = format!("{} — OmniView Viewer ({} / {})", entry.filename, curr_idx + 1, total_in_view);
 
-                // Top Toolbar
-                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(top_rect), |ui| {
+        let active_tex_clone = self.viewer_texture.as_ref()
+            .map(|(_, tex)| tex.clone())
+            .or_else(|| self.textures.get(&entry.path).cloned());
+
+        let mut viewer_pan = self.viewer_pan;
+        let mut viewer_zoom = self.viewer_zoom;
+        let mut viewer_is_fit = self.viewer_is_fit;
+        let dark_mode = self.dark_mode;
+
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("omniview_viewer_subwindow"),
+            egui::ViewportBuilder::default()
+                .with_title(&title)
+                .with_inner_size([1150.0, 860.0])
+                .with_min_inner_size([640.0, 480.0])
+                .with_app_id("omniview-viewer"),
+            |sub_ctx, _class| {
+                if dark_mode {
+                    sub_ctx.set_visuals(egui::Visuals::dark());
+                } else {
+                    sub_ctx.set_visuals(egui::Visuals::light());
+                }
+
+                if sub_ctx.input(|i| i.viewport().close_requested()) {
+                    close_requested = true;
+                }
+                if sub_ctx.input(|i| i.key_pressed(Key::Escape)) {
+                    close_requested = true;
+                }
+                if sub_ctx.input(|i| i.key_pressed(Key::ArrowLeft)) {
+                    nav_prev = true;
+                }
+                if sub_ctx.input(|i| i.key_pressed(Key::ArrowRight)) {
+                    nav_next = true;
+                }
+                if sub_ctx.input(|i| i.key_pressed(Key::Space)) {
+                    toggle_fit = true;
+                }
+
+                egui::TopBottomPanel::top("viewer_top_panel").show(sub_ctx, |ui| {
+                    ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing = Vec2::new(10.0, 0.0);
                         let size_mb = entry.file_size as f64 / (1024.0 * 1024.0);
@@ -275,17 +312,16 @@ impl OmniViewApp {
 
                         ui.label(
                             egui::RichText::new(format!(
-                                "{}  •  {}  •  {:.2} MB  •  📁 {}  ({} / {})",
-                                entry.filename, dim_str, size_mb, entry.subfolder, curr_idx + 1, total_in_view
+                                "{}  •  {}  •  {:.2} MB  •  📁 {}",
+                                entry.filename, dim_str, size_mb, entry.subfolder
                             ))
-                            .color(Color32::WHITE)
                             .strong()
                             .size(13.0),
                         );
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.button("✕ Close (Esc)").clicked() {
-                                self.viewing_index = None;
+                                close_requested = true;
                             }
                             if ui.button("↗️ Open Default").clicked() {
                                 open_in_default_app(&entry.path);
@@ -296,127 +332,126 @@ impl OmniViewApp {
                             if ui.button("📋 Copy Path").clicked() {
                                 copy_text(&entry.path.to_string_lossy());
                             }
-                            if ui.button("📤 Drag to Share").clicked() {
+                            if ui.button(egui::RichText::new("📤 Drag to Attach").strong()).clicked() {
                                 start_drag_files(&[entry.path.clone()]);
                             }
-                            if ui.button("📁 Copy File (Attach)").clicked() {
-                                copy_file_uri(&entry.path);
+                            if ui.button(egui::RichText::new("📁 Copy File (Attach)").strong()).clicked() {
+                                copy_files_uris(&[entry.path.clone()]);
                             }
                         });
                     });
+                    ui.add_space(4.0);
                 });
 
-                // Central Image Viewport
-                let mut view_rect = screen_rect;
-                view_rect.min.y += 48.0;
-                view_rect.max.y -= 48.0;
-
-                let active_tex = self.viewer_texture.as_ref()
-                    .map(|(_, tex)| tex)
-                    .or_else(|| self.textures.get(&entry.path));
-
-                if let Some(tex) = active_tex {
-                    let img_size = tex.size_vec2();
-
-                    // Calculate sensible Fit Scale (fills ~95% of available space)
-                    let scale_x = view_rect.width() / img_size.x;
-                    let scale_y = view_rect.height() / img_size.y;
-                    let fit_scale = scale_x.min(scale_y) * 0.95;
-
-                    let final_scale = if self.viewer_is_fit {
-                        fit_scale
-                    } else {
-                        self.viewer_zoom
-                    };
-
-                    let display_size = img_size * final_scale;
-                    let center_pos = view_rect.center() + self.viewer_pan;
-                    let img_rect = Rect::from_center_size(center_pos, display_size);
-
-                    // Render the image
-                    ui.painter().image(
-                        tex.id(),
-                        img_rect,
-                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                        Color32::WHITE,
-                    );
-
-                    // Pan and zoom interaction
-                    let response = ui.allocate_rect(view_rect, egui::Sense::click_and_drag());
-                    if response.dragged() {
-                        self.viewer_pan += response.drag_delta();
-                    }
-
-                    // Mouse wheel zoom
-                    let scroll_delta = ui.input(|i| i.raw_scroll_delta.y);
-                    if scroll_delta != 0.0 {
-                        self.viewer_is_fit = false;
-                        let factor = if scroll_delta > 0.0 { 1.15 } else { 1.0 / 1.15 };
-                        self.viewer_zoom = (self.viewer_zoom * factor).clamp(0.05, 50.0);
-                    }
-
-                    // Double click toggle fit / 100%
-                    if response.double_clicked() {
-                        self.viewer_is_fit = !self.viewer_is_fit;
-                        self.viewer_pan = Vec2::ZERO;
-                        if !self.viewer_is_fit {
-                            self.viewer_zoom = 1.0;
-                        }
-                    }
-                }
-
-                // Bottom Navigation Bar
-                let mut bot_rect = screen_rect;
-                bot_rect.min.y = bot_rect.max.y - 48.0;
-
-                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(bot_rect), |ui| {
+                egui::TopBottomPanel::bottom("viewer_bottom_panel").show(sub_ctx, |ui| {
+                    ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         if ui.button("◀ Previous (Left)").clicked() && curr_idx > 0 {
-                            self.viewing_index = Some(curr_idx - 1);
+                            nav_prev = true;
                         }
                         if ui.button("Next (Right) ▶").clicked() && curr_idx + 1 < total_in_view {
-                            self.viewing_index = Some(curr_idx + 1);
+                            nav_next = true;
                         }
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("Fit to Window").clicked() {
-                                self.viewer_is_fit = true;
-                                self.viewer_pan = Vec2::ZERO;
+                            if ui.button("Fit to Window (Space)").clicked() {
+                                viewer_is_fit = true;
+                                viewer_pan = Vec2::ZERO;
                             }
                             if ui.button("1:1 (100%)").clicked() {
-                                self.viewer_is_fit = false;
-                                self.viewer_zoom = 1.0;
-                                self.viewer_pan = Vec2::ZERO;
+                                viewer_is_fit = false;
+                                viewer_zoom = 1.0;
+                                viewer_pan = Vec2::ZERO;
                             }
                             if ui.button("🔍 +").clicked() {
-                                self.viewer_is_fit = false;
-                                self.viewer_zoom *= 1.25;
+                                viewer_is_fit = false;
+                                viewer_zoom *= 1.25;
                             }
                             if ui.button("🔍 -").clicked() {
-                                self.viewer_is_fit = false;
-                                self.viewer_zoom *= 0.8;
+                                viewer_is_fit = false;
+                                viewer_zoom *= 0.8;
                             }
                         });
                     });
+                    ui.add_space(4.0);
                 });
-            });
 
-        // Shortcuts
-        if ctx.input(|i| i.key_pressed(Key::Escape)) {
-            self.viewing_index = None;
-        }
-        if ctx.input(|i| i.key_pressed(Key::ArrowLeft)) && curr_idx > 0 {
-            self.viewing_index = Some(curr_idx - 1);
-        }
-        if ctx.input(|i| i.key_pressed(Key::ArrowRight)) && curr_idx + 1 < total_in_view {
-            self.viewing_index = Some(curr_idx + 1);
-        }
-        if ctx.input(|i| i.key_pressed(Key::Space)) {
-            self.viewer_is_fit = !self.viewer_is_fit;
-            self.viewer_pan = Vec2::ZERO;
-            if !self.viewer_is_fit {
-                self.viewer_zoom = 1.0;
+                egui::CentralPanel::default().show(sub_ctx, |ui| {
+                    let avail_rect = ui.available_rect_before_wrap();
+
+                    if let Some(tex) = &active_tex_clone {
+                        let img_size = tex.size_vec2();
+
+                        let scale_x = avail_rect.width() / img_size.x;
+                        let scale_y = avail_rect.height() / img_size.y;
+                        let fit_scale = scale_x.min(scale_y) * 0.98;
+
+                        let final_scale = if viewer_is_fit {
+                            fit_scale
+                        } else {
+                            viewer_zoom
+                        };
+
+                        let display_size = img_size * final_scale;
+                        let center_pos = avail_rect.center() + viewer_pan;
+                        let img_rect = Rect::from_center_size(center_pos, display_size);
+
+                        ui.painter().image(
+                            tex.id(),
+                            img_rect,
+                            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                            Color32::WHITE,
+                        );
+
+                        let response = ui.allocate_rect(avail_rect, egui::Sense::click_and_drag());
+                        if response.dragged() {
+                            viewer_pan += response.drag_delta();
+                        }
+
+                        let scroll_delta = ui.input(|i| i.raw_scroll_delta.y);
+                        if scroll_delta != 0.0 {
+                            viewer_is_fit = false;
+                            let factor = if scroll_delta > 0.0 { 1.15 } else { 1.0 / 1.15 };
+                            viewer_zoom = (viewer_zoom * factor).clamp(0.05, 50.0);
+                        }
+
+                        if response.double_clicked() {
+                            viewer_is_fit = !viewer_is_fit;
+                            viewer_pan = Vec2::ZERO;
+                            if !viewer_is_fit {
+                                viewer_zoom = 1.0;
+                            }
+                        }
+                    } else {
+                        ui.centered_and_justified(|ui| {
+                            ui.spinner();
+                        });
+                    }
+                });
+            },
+        );
+
+        if toggle_fit {
+            viewer_is_fit = !viewer_is_fit;
+            viewer_pan = Vec2::ZERO;
+            if !viewer_is_fit {
+                viewer_zoom = 1.0;
             }
+        }
+
+        self.viewer_pan = viewer_pan;
+        self.viewer_zoom = viewer_zoom;
+        self.viewer_is_fit = viewer_is_fit;
+
+        if close_requested {
+            self.viewing_index = None;
+            self.viewer_texture = None;
+        } else if nav_next && curr_idx + 1 < total_in_view {
+            self.viewing_index = Some(curr_idx + 1);
+            self.viewer_texture = None;
+        } else if nav_prev && curr_idx > 0 {
+            self.viewing_index = Some(curr_idx - 1);
+            self.viewer_texture = None;
         }
     }
 }

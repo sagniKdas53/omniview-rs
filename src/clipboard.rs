@@ -37,13 +37,54 @@ pub fn copy_files_uris<P: AsRef<Path>>(paths: &[P]) {
     }
 
     let uri_list = format_uri_list(paths);
+    let path_bufs: Vec<PathBuf> = paths.iter().map(|p| p.as_ref().to_path_buf()).collect();
 
-    // Try setting clipboard via arboard text
+    // 1. Native file_list via arboard
     if let Ok(mut clip) = Clipboard::new() {
-        let _ = clip.set_text(uri_list.trim());
+        let _ = clip.set().file_list(&path_bufs);
     }
 
-    // On Linux X11/Wayland, also try setting text/uri-list via xclip or wl-copy if available
+    // 2. Python PyQt5 helper: sets x-special/gnome-copied-files (for Dolphin/Nautilus) and text/uri-list
+    let abs_paths: Vec<String> = paths
+        .iter()
+        .map(|p| {
+            let pref = p.as_ref();
+            std::fs::canonicalize(pref)
+                .unwrap_or_else(|_| pref.to_path_buf())
+                .to_string_lossy()
+                .to_string()
+        })
+        .collect();
+
+    let py_clip = r#"
+import sys
+from PyQt5.QtWidgets import QApplication
+from PyQt5.QtCore import QUrl, QMimeData, QByteArray, QTimer
+
+app = QApplication(sys.argv)
+paths = sys.argv[1:]
+urls = [QUrl.fromLocalFile(p) for p in paths]
+
+mime = QMimeData()
+mime.setUrls(urls)
+gnome_str = "copy\n" + "\n".join([u.toString() for u in urls])
+mime.setData("x-special/gnome-copied-files", QByteArray(gnome_str.encode("utf-8")))
+mime.setText("\n".join(paths))
+
+app.clipboard().setMimeData(mime)
+
+# Stay alive for 3 minutes to serve paste requests, or until next copy
+QTimer.singleShot(180_000, app.quit)
+app.exec_()
+"#;
+
+    let _ = Command::new("python3")
+        .arg("-c")
+        .arg(py_clip)
+        .args(&abs_paths)
+        .spawn();
+
+    // 3. Fallback: try xclip or wl-copy if available
     let _ = Command::new("xclip")
         .args(["-selection", "clipboard", "-t", "text/uri-list"])
         .stdin(std::process::Stdio::piped())
@@ -102,10 +143,13 @@ pub fn open_in_default_app<P: AsRef<Path>>(path: P) {
 
 pub fn reveal_in_file_manager<P: AsRef<Path>>(path: P) {
     let p = path.as_ref();
-    let res = Command::new("nautilus").arg("--select").arg(p).spawn();
+    let res = Command::new("dolphin").arg("--select").arg(p).spawn();
     if res.is_err() {
-        if let Some(parent) = p.parent() {
-            let _ = Command::new("xdg-open").arg(parent).spawn();
+        let res2 = Command::new("nautilus").arg("--select").arg(p).spawn();
+        if res2.is_err() {
+            if let Some(parent) = p.parent() {
+                let _ = Command::new("xdg-open").arg(parent).spawn();
+            }
         }
     }
 }
@@ -155,17 +199,30 @@ pub fn start_drag_files<P: AsRef<Path>>(paths: &[P]) {
 
     let file_args: Vec<String> = paths
         .iter()
-        .map(|p| p.as_ref().to_string_lossy().to_string())
+        .map(|p| {
+            let pref = p.as_ref();
+            std::fs::canonicalize(pref)
+                .unwrap_or_else(|_| pref.to_path_buf())
+                .to_string_lossy()
+                .to_string()
+        })
         .collect();
 
-    // Try dragon utility first
+    // Ensure files are also ready on clipboard for instant Ctrl+V pasting into apps
+    copy_files_uris(paths);
+
+    // Try dragon utility with compact, auto-exit mode
     if let Some(dragon_path) = find_dragon_binary() {
         let mut cmd = Command::new(dragon_path);
-        // -x: exit after completed drop
-        // -a: drag all files at once
+        // -x: exit immediately after a single completed drop
         // -T: always on top
-        // -s 120: preview size
-        cmd.args(["-x", "-a", "-T", "-s", "120"]);
+        if file_args.len() == 1 {
+            // Single file: show clean 96px thumbnail
+            cmd.args(["-x", "-T", "-s", "96"]);
+        } else {
+            // Multiple files: -A shows compact badge "Drag N files" instead of huge list
+            cmd.args(["-x", "-A", "-T"]);
+        }
         cmd.args(&file_args);
         if cmd.spawn().is_ok() {
             return;

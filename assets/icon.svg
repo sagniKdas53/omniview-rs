@@ -1,0 +1,96 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <!-- Background Gradient -->
+    <radialGradient id="bgGrad" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#111927" />
+      <stop offset="70%" stop-color="#0a0e17" />
+      <stop offset="100%" stop-color="#060910" />
+    </radialGradient>
+
+    <!-- Outer Ring Gradient (Electric Blue / Cyan - Inverted Insomnia Motif) -->
+    <linearGradient id="ringGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38bdf8" />
+      <stop offset="50%" stop-color="#00f0ff" />
+      <stop offset="100%" stop-color="#0284c7" />
+    </linearGradient>
+
+    <!-- Ambient Eye Glow -->
+    <radialGradient id="eyeGlow" cx="50%" cy="52%" r="48%">
+      <stop offset="0%" stop-color="#00f0ff" stop-opacity="0.32" />
+      <stop offset="50%" stop-color="#0284c7" stop-opacity="0.12" />
+      <stop offset="100%" stop-color="#000000" stop-opacity="0" />
+    </radialGradient>
+
+    <!-- Iris Gradient -->
+    <radialGradient id="irisGrad" cx="46%" cy="42%" r="56%">
+      <stop offset="0%" stop-color="#67e8f9" />
+      <stop offset="35%" stop-color="#00d2ff" />
+      <stop offset="72%" stop-color="#0284c7" />
+      <stop offset="100%" stop-color="#1d4ed8" />
+    </radialGradient>
+
+    <!-- Upper Eyelid Highlight Gradient -->
+    <linearGradient id="lidGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#0284c7" />
+      <stop offset="18%" stop-color="#38bdf8" />
+      <stop offset="50%" stop-color="#f0f9ff" />
+      <stop offset="82%" stop-color="#38bdf8" />
+      <stop offset="100%" stop-color="#0284c7" />
+    </linearGradient>
+
+    <!-- Eye Clip Path for Mid-Blink Opening -->
+    <clipPath id="eyeClip">
+      <path d="M 84,260 
+               C 170,236 342,236 428,260 
+               C 365,395 147,395 84,260 Z" />
+    </clipPath>
+  </defs>
+
+  <!-- 1. Base Dark Circular Badge -->
+  <circle cx="256" cy="256" r="236" fill="url(#bgGrad)" />
+
+  <!-- 2. Luminous Inverted Insomnia Outer Ring -->
+  <circle cx="256" cy="256" r="226" fill="none" stroke="url(#ringGrad)" stroke-width="14" />
+
+  <!-- 3. Ambient Blue Eye Glow -->
+  <circle cx="256" cy="270" r="185" fill="url(#eyeGlow)" />
+
+  <!-- 4. Eye Interior (Clipped to Mid-Blink Contour) -->
+  <g clip-path="url(#eyeClip)">
+    <!-- Deep Sclera Background -->
+    <rect x="0" y="0" width="512" height="512" fill="#0b1120" />
+
+    <!-- Luminous Blue Iris -->
+    <circle cx="256" cy="295" r="116" fill="url(#irisGrad)" />
+
+    <!-- Iris Rim / Accent Rings -->
+    <circle cx="256" cy="295" r="116" fill="none" stroke="#00f0ff" stroke-width="3" opacity="0.65" />
+    <circle cx="256" cy="295" r="96" fill="none" stroke="#38bdf8" stroke-width="1.8" opacity="0.45" />
+
+    <!-- Pupil (Obsidian Dark) -->
+    <circle cx="256" cy="295" r="50" fill="#070a12" />
+
+    <!-- Insomnia Signature Cutout: Circular bite taken out of pupil (top-left) -->
+    <circle cx="233" cy="274" r="26" fill="#f0f9ff" />
+
+    <!-- Secondary glint (bottom-right) -->
+    <circle cx="277" cy="313" r="8.5" fill="#ffffff" opacity="0.95" />
+  </g>
+
+  <!-- 5. Eyelids & Sleek Contour Outlines -->
+  <!-- Lower Lid Line -->
+  <path d="M 84,260 C 147,395 365,395 428,260" 
+        fill="none" stroke="#0284c7" stroke-width="8" stroke-linecap="round" />
+
+  <!-- Upper Lid Soft Ambient Glow -->
+  <path d="M 80,260 C 170,236 342,236 432,260" 
+        fill="none" stroke="#38bdf8" stroke-width="20" stroke-opacity="0.25" />
+
+  <!-- Upper Lid (Mid-Blink) Main Stroke -->
+  <path d="M 80,260 C 170,236 342,236 432,260" 
+        fill="none" stroke="url(#lidGrad)" stroke-width="12" stroke-linecap="round" />
+
+  <!-- Eyelid Fold Crease Above (Relaxed in Mid-Blink) -->
+  <path d="M 142,185 C 210,158 302,158 370,185" 
+        fill="none" stroke="#38bdf8" stroke-width="8" stroke-linecap="round" opacity="0.85" />
+</svg>

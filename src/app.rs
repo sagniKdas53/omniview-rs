@@ -1,5 +1,5 @@
 use crossbeam_channel::{unbounded, Receiver, Sender};
-use eframe::egui::{self, Color32, ColorImage, Frame, Key, Pos2, Rect, CornerRadius, Stroke, TextureHandle, TextureOptions, Vec2};
+use eframe::egui::{self, Color32, ColorImage, Key, Pos2, Rect, CornerRadius, Stroke, TextureHandle, TextureOptions, Vec2};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -218,13 +218,16 @@ impl OmniViewApp {
     }
 
     fn render_lightbox(&mut self, ctx: &egui::Context) {
+        let filtered_indices = self.get_filtered_indices();
+        let total_in_view = filtered_indices.len();
         let Some(curr_idx) = self.viewing_index else { return };
-        if curr_idx >= self.all_entries.len() {
+        if curr_idx >= total_in_view {
             self.viewing_index = None;
             return;
         }
 
-        let entry = self.all_entries[curr_idx].clone();
+        let global_idx = filtered_indices[curr_idx];
+        let entry = self.all_entries[global_idx].clone();
 
         // Ensure full high-res texture is loaded
         if self.viewer_texture.as_ref().map(|(p, _)| p != &entry.path).unwrap_or(true) {
@@ -264,7 +267,7 @@ impl OmniViewApp {
                         ui.label(
                             egui::RichText::new(format!(
                                 "{}  •  {}  •  {:.2} MB  •  📁 {}  ({} / {})",
-                                entry.filename, dim_str, size_mb, entry.subfolder, curr_idx + 1, self.all_entries.len()
+                                entry.filename, dim_str, size_mb, entry.subfolder, curr_idx + 1, total_in_view
                             ))
                             .color(Color32::WHITE)
                             .strong()
@@ -297,7 +300,11 @@ impl OmniViewApp {
                 view_rect.min.y += 48.0;
                 view_rect.max.y -= 48.0;
 
-                if let Some((_, ref tex)) = self.viewer_texture {
+                let active_tex = self.viewer_texture.as_ref()
+                    .map(|(_, tex)| tex)
+                    .or_else(|| self.textures.get(&entry.path));
+
+                if let Some(tex) = active_tex {
                     let img_size = tex.size_vec2();
 
                     // Calculate sensible Fit Scale (fills ~95% of available space)
@@ -334,7 +341,7 @@ impl OmniViewApp {
                     if scroll_delta != 0.0 {
                         self.viewer_is_fit = false;
                         let factor = if scroll_delta > 0.0 { 1.15 } else { 1.0 / 1.15 };
-                        self.viewer_zoom *= factor;
+                        self.viewer_zoom = (self.viewer_zoom * factor).clamp(0.05, 50.0);
                     }
 
                     // Double click toggle fit / 100%
@@ -356,7 +363,7 @@ impl OmniViewApp {
                         if ui.button("◀ Previous (Left)").clicked() && curr_idx > 0 {
                             self.viewing_index = Some(curr_idx - 1);
                         }
-                        if ui.button("Next (Right) ▶").clicked() && curr_idx + 1 < self.all_entries.len() {
+                        if ui.button("Next (Right) ▶").clicked() && curr_idx + 1 < total_in_view {
                             self.viewing_index = Some(curr_idx + 1);
                         }
 
@@ -390,7 +397,7 @@ impl OmniViewApp {
         if ctx.input(|i| i.key_pressed(Key::ArrowLeft)) && curr_idx > 0 {
             self.viewing_index = Some(curr_idx - 1);
         }
-        if ctx.input(|i| i.key_pressed(Key::ArrowRight)) && curr_idx + 1 < self.all_entries.len() {
+        if ctx.input(|i| i.key_pressed(Key::ArrowRight)) && curr_idx + 1 < total_in_view {
             self.viewing_index = Some(curr_idx + 1);
         }
         if ctx.input(|i| i.key_pressed(Key::Space)) {
@@ -562,68 +569,88 @@ impl eframe::App for OmniViewApp {
                                         self.request_thumbnail(&entry);
                                     }
 
-                                    // Card Frame
-                                    let card_rect = ui.available_rect_before_wrap();
-                                    let _card_bounds = Rect::from_min_size(card_rect.min, Vec2::new(card_w, card_h));
+                                    // Allocate interactive card rect with click sensing
+                                    let (card_rect, card_resp) = ui.allocate_exact_size(
+                                        Vec2::new(card_w, card_h),
+                                        egui::Sense::click(),
+                                    );
 
-                                    let card_frame = Frame::canvas(ui.style())
-                                        .corner_radius(CornerRadius::same(6))
-                                        .stroke(Stroke::new(1.0_f32, if self.dark_mode { Color32::from_rgb(45, 50, 65) } else { Color32::from_rgb(220, 225, 235) }))
-                                        .fill(if self.dark_mode { Color32::from_rgb(22, 25, 34) } else { Color32::from_rgb(248, 250, 252) });
-
-                                    let response = card_frame.show(ui, |ui| {
-                                        ui.set_width(card_w);
-                                        ui.set_height(card_h);
-                                        ui.vertical(|ui| {
-                                            let thumb_height = card_w - 6.0;
-                                            let thumb_area = Rect::from_min_size(
-                                                ui.cursor().min + Vec2::new(3.0, 3.0),
-                                                Vec2::new(card_w - 6.0, thumb_height),
-                                            );
-
-                                            if let Some(tex) = self.textures.get(&entry.path) {
-                                                let t_size = tex.size_vec2();
-                                                let scale = (thumb_area.width() / t_size.x).min(thumb_area.height() / t_size.y);
-                                                let draw_size = t_size * scale;
-                                                let draw_rect = Rect::from_center_size(thumb_area.center(), draw_size);
-
-                                                ui.painter().image(
-                                                    tex.id(),
-                                                    draw_rect,
-                                                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                                                    Color32::WHITE,
-                                                );
-                                            } else {
-                                                ui.painter().rect_filled(
-                                                    thumb_area,
-                                                    CornerRadius::same(4),
-                                                    if self.dark_mode { Color32::from_rgb(28, 32, 44) } else { Color32::from_rgb(230, 235, 245) },
-                                                );
-                                            }
-
-                                            ui.add_space(thumb_height + 2.0);
-
-                                            // Filename & Details
-                                            ui.horizontal(|ui| {
-                                                ui.add_space(4.0);
-                                                ui.label(
-                                                    egui::RichText::new(&entry.filename)
-                                                        .size(11.0)
-                                                        .color(if self.dark_mode { Color32::from_rgb(220, 225, 235) } else { Color32::from_rgb(30, 40, 55) }),
-                                                );
-                                            });
-                                        });
-                                    });
-
-                                    // Double click opens Lightbox
-                                    if response.response.double_clicked() {
-                                        self.viewing_index = Some(global_idx);
+                                    // Single click or double click opens the Lightbox Viewer!
+                                    if card_resp.clicked() || card_resp.double_clicked() {
+                                        self.viewing_index = Some(item_idx_in_filtered);
                                     }
 
+                                    // Hover styling & pointer cursor
+                                    let is_hovered = card_resp.hovered();
+                                    if is_hovered {
+                                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                    }
+
+                                    let bg_color = if is_hovered {
+                                        if self.dark_mode { Color32::from_rgb(34, 40, 56) } else { Color32::from_rgb(235, 242, 252) }
+                                    } else {
+                                        if self.dark_mode { Color32::from_rgb(22, 25, 34) } else { Color32::from_rgb(248, 250, 252) }
+                                    };
+
+                                    let stroke = if is_hovered {
+                                        Stroke::new(1.5_f32, if self.dark_mode { Color32::from_rgb(90, 160, 255) } else { Color32::from_rgb(40, 120, 230) })
+                                    } else {
+                                        Stroke::new(1.0_f32, if self.dark_mode { Color32::from_rgb(45, 50, 65) } else { Color32::from_rgb(220, 225, 235) })
+                                    };
+
+                                    ui.painter().rect(card_rect, CornerRadius::same(6), bg_color, stroke, egui::StrokeKind::Inside);
+
+                                    // Thumbnail bounds inside card
+                                    let pad = 4.0;
+                                    let thumb_h = card_w - (pad * 2.0);
+                                    let thumb_area = Rect::from_min_size(
+                                        card_rect.min + Vec2::new(pad, pad),
+                                        Vec2::new(card_w - (pad * 2.0), thumb_h),
+                                    );
+
+                                    if let Some(tex) = self.textures.get(&entry.path) {
+                                        let t_size = tex.size_vec2();
+                                        let scale = (thumb_area.width() / t_size.x).min(thumb_area.height() / t_size.y);
+                                        let draw_size = t_size * scale;
+                                        let draw_rect = Rect::from_center_size(thumb_area.center(), draw_size);
+
+                                        ui.painter().image(
+                                            tex.id(),
+                                            draw_rect,
+                                            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                            Color32::WHITE,
+                                        );
+                                    } else {
+                                        ui.painter().rect_filled(
+                                            thumb_area,
+                                            CornerRadius::same(4),
+                                            if self.dark_mode { Color32::from_rgb(28, 32, 44) } else { Color32::from_rgb(230, 235, 245) },
+                                        );
+                                    }
+
+                                    // Filename label
+                                    let text_color = if self.dark_mode { Color32::from_rgb(220, 225, 235) } else { Color32::from_rgb(30, 40, 55) };
+                                    let text_pos = Pos2::new(card_rect.min.x + pad + 2.0, thumb_area.max.y + 4.0);
+                                    let max_chars = ((card_w - pad * 2.0) / 7.0).max(8.0) as usize;
+                                    let display_name = if entry.filename.chars().count() > max_chars {
+                                        let s: String = entry.filename.chars().take(max_chars.saturating_sub(3)).collect();
+                                        format!("{}...", s)
+                                    } else {
+                                        entry.filename.clone()
+                                    };
+
+                                    ui.painter().text(
+                                        text_pos,
+                                        egui::Align2::LEFT_TOP,
+                                        display_name,
+                                        egui::FontId::proportional(11.0),
+                                        text_color,
+                                    );
+
                                     // Context Menu on right click
-                                    response.response.context_menu(|ui| {
+                                    card_resp.context_menu(|ui| {
                                         if ui.button("🔍 Open in Viewer").clicked() {
-                                            self.viewing_index = Some(global_idx);
+                                            self.viewing_index = Some(item_idx_in_filtered);
                                             ui.close_menu();
                                         }
                                         ui.separator();
@@ -663,5 +690,154 @@ impl eframe::App for OmniViewApp {
 
         // 4. Lightbox Viewer Overlay (if active)
         self.render_lightbox(ctx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    fn make_test_entry(name: &str, sub: &str, size: u64, w: u32, h: u32, secs_ago: u64) -> ImageEntry {
+        ImageEntry {
+            path: PathBuf::from(format!("/fake/{}/{}", sub, name)),
+            filename: name.to_string(),
+            subfolder: sub.to_string(),
+            file_size: size,
+            mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000 - secs_ago),
+            width: w,
+            height: h,
+        }
+    }
+
+    fn create_test_app() -> OmniViewApp {
+        let (thumb_tx, thumb_rx) = unbounded();
+        let (watcher_tx, watcher_rx) = unbounded();
+        let cache = Arc::new(ThumbnailCache {
+            cache_dir: PathBuf::from("/tmp/test_cache_app"),
+        });
+
+        let entries = vec![
+            make_test_entry("portrait.png", "folder_a", 1000, 800, 1200, 10),  // ratio ~0.66 (Portrait)
+            make_test_entry("landscape.jpg", "folder_a", 5000, 1920, 1080, 50), // ratio ~1.77 (Landscape)
+            make_test_entry("square.webp", "folder_b", 2000, 1000, 1000, 20),  // ratio 1.0 (Square)
+            make_test_entry("zeta.png", "folder_b", 8000, 1600, 900, 100),     // Landscape, largest
+            make_test_entry("alpha.png", "folder_c", 500, 600, 900, 5),        // Portrait, smallest, newest
+        ];
+
+        OmniViewApp {
+            current_dir: PathBuf::from("/fake"),
+            all_entries: entries,
+            subfolders: vec![("folder_a".into(), 2), ("folder_b".into(), 2), ("folder_c".into(), 1)],
+            selected_subfolder: None,
+            folder_search: String::new(),
+            search_term: String::new(),
+            aspect_filter: AspectFilter::All,
+            sort_mode: SortMode::Newest,
+            card_size: 220.0,
+            dark_mode: true,
+            cache,
+            textures: HashMap::new(),
+            pending_requests: HashSet::new(),
+            thumb_tx,
+            thumb_rx,
+            watcher: None,
+            watcher_rx,
+            watcher_tx,
+            viewing_index: None,
+            viewer_texture: None,
+            viewer_zoom: 1.0,
+            viewer_pan: Vec2::ZERO,
+            viewer_is_fit: true,
+            total_bytes: 16500,
+        }
+    }
+
+    #[test]
+    fn test_filter_by_subfolder() {
+        let mut app = create_test_app();
+        assert_eq!(app.get_filtered_indices().len(), 5);
+
+        app.selected_subfolder = Some("folder_a".to_string());
+        let indices = app.get_filtered_indices();
+        assert_eq!(indices.len(), 2);
+        for &idx in &indices {
+            assert_eq!(app.all_entries[idx].subfolder, "folder_a");
+        }
+
+        app.selected_subfolder = Some("folder_c".to_string());
+        let indices = app.get_filtered_indices();
+        assert_eq!(indices.len(), 1);
+        assert_eq!(app.all_entries[indices[0]].filename, "alpha.png");
+    }
+
+    #[test]
+    fn test_filter_by_search_term() {
+        let mut app = create_test_app();
+
+        // Search by partial filename
+        app.search_term = "LANDSCAPE".to_string(); // case-insensitive
+        let indices = app.get_filtered_indices();
+        assert_eq!(indices.len(), 1);
+        assert_eq!(app.all_entries[indices[0]].filename, "landscape.jpg");
+
+        // Search matching subfolder name
+        app.search_term = "folder_b".to_string();
+        let indices = app.get_filtered_indices();
+        assert_eq!(indices.len(), 2);
+    }
+
+    #[test]
+    fn test_filter_by_aspect_ratio() {
+        let mut app = create_test_app();
+
+        // Portrait (< 0.85)
+        app.aspect_filter = AspectFilter::Portrait;
+        let p_indices = app.get_filtered_indices();
+        assert_eq!(p_indices.len(), 2); // portrait.png (800x1200) and alpha.png (600x900)
+
+        // Landscape (> 1.18)
+        app.aspect_filter = AspectFilter::Landscape;
+        let l_indices = app.get_filtered_indices();
+        assert_eq!(l_indices.len(), 2); // landscape.jpg (1920x1080) and zeta.png (1600x900)
+
+        // Square (0.85 .. 1.18)
+        app.aspect_filter = AspectFilter::Square;
+        let s_indices = app.get_filtered_indices();
+        assert_eq!(s_indices.len(), 1);
+        assert_eq!(app.all_entries[s_indices[0]].filename, "square.webp");
+    }
+
+    #[test]
+    fn test_sort_modes() {
+        let mut app = create_test_app();
+
+        // Name Ascending
+        app.sort_mode = SortMode::NameAsc;
+        let indices = app.get_filtered_indices();
+        let names: Vec<&str> = indices.iter().map(|&i| app.all_entries[i].filename.as_str()).collect();
+        assert_eq!(names, vec!["alpha.png", "landscape.jpg", "portrait.png", "square.webp", "zeta.png"]);
+
+        // Size Descending
+        app.sort_mode = SortMode::SizeDesc;
+        let indices = app.get_filtered_indices();
+        let sizes: Vec<u64> = indices.iter().map(|&i| app.all_entries[i].file_size).collect();
+        assert_eq!(sizes, vec![8000, 5000, 2000, 1000, 500]);
+
+        // Size Ascending
+        app.sort_mode = SortMode::SizeAsc;
+        let indices = app.get_filtered_indices();
+        let sizes: Vec<u64> = indices.iter().map(|&i| app.all_entries[i].file_size).collect();
+        assert_eq!(sizes, vec![500, 1000, 2000, 5000, 8000]);
+
+        // Newest First (smallest secs_ago)
+        app.sort_mode = SortMode::Newest;
+        let indices = app.get_filtered_indices();
+        assert_eq!(app.all_entries[indices[0]].filename, "alpha.png"); // 5 secs ago
+
+        // Oldest First (largest secs_ago)
+        app.sort_mode = SortMode::Oldest;
+        let indices = app.get_filtered_indices();
+        assert_eq!(app.all_entries[indices[0]].filename, "zeta.png"); // 100 secs ago
     }
 }

@@ -42,6 +42,7 @@ impl ThumbnailCache {
         let cache_path = self.get_cache_path(source_path, mtime, file_size);
 
         // 1. If WebP thumbnail exists in cache, load directly!
+        let meta_path = cache_path.with_extension("meta");
         if cache_path.exists() {
             if let Ok(cached_bytes) = fs::read(&cache_path) {
                 if !cached_bytes.is_empty() {
@@ -52,7 +53,25 @@ impl ThumbnailCache {
                             [w as usize, h as usize],
                             rgba.as_flat_samples().as_slice(),
                         );
-                        return Some((w, h, color_image));
+
+                        // Read true original dimensions from .meta or fast header probe
+                        let (orig_w, orig_h) = if let Ok(meta_str) = fs::read_to_string(&meta_path) {
+                            let parts: Vec<&str> = meta_str.trim().split(',').collect();
+                            if parts.len() == 2 {
+                                let ow = parts[0].parse::<u32>().unwrap_or(w);
+                                let oh = parts[1].parse::<u32>().unwrap_or(h);
+                                (ow, oh)
+                            } else {
+                                (w, h)
+                            }
+                        } else if let Ok(dims) = image::image_dimensions(source_path) {
+                            let _ = fs::write(&meta_path, format!("{},{}", dims.0, dims.1));
+                            dims
+                        } else {
+                            (w, h)
+                        };
+
+                        return Some((orig_w, orig_h, color_image));
                     }
                 }
             }
@@ -78,6 +97,7 @@ impl ThumbnailCache {
         let encoder = webp::Encoder::from_rgb(&rgb, actual_w, actual_h);
         let webp_memory = encoder.encode(85.0);
         let _ = fs::write(&cache_path, &*webp_memory);
+        let _ = fs::write(&meta_path, format!("{},{}", orig_w, orig_h));
 
         // Return egui ColorImage
         let rgba = resized.to_rgba8();
@@ -87,5 +107,70 @@ impl ThumbnailCache {
         );
 
         Some((orig_w, orig_h, color_image))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::{Rgb, RgbImage};
+    use std::time::Duration;
+
+    #[test]
+    fn test_cache_path_determinism() {
+        let cache = ThumbnailCache {
+            cache_dir: PathBuf::from("/tmp/test_cache"),
+        };
+        let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(123456);
+        let path1 = PathBuf::from("/path/to/image.png");
+        let path2 = PathBuf::from("/path/to/other.png");
+
+        let p1_a = cache.get_cache_path(&path1, mtime, 5000);
+        let p1_b = cache.get_cache_path(&path1, mtime, 5000);
+        let p2 = cache.get_cache_path(&path2, mtime, 5000);
+
+        assert_eq!(p1_a, p1_b, "Cache path must be deterministic for identical inputs");
+        assert_ne!(p1_a, p2, "Cache paths must differ for different files");
+        assert!(p1_a.to_string_lossy().ends_with(".webp"));
+    }
+
+    #[test]
+    fn test_load_or_generate_thumbnail_and_preserve_dimensions() {
+        let temp_dir = std::env::temp_dir().join(format!("omniview_cache_test_{}", std::process::id()));
+        let _ = fs::create_dir_all(&temp_dir);
+        let cache = ThumbnailCache {
+            cache_dir: temp_dir.join("cache"),
+        };
+        let _ = fs::create_dir_all(&cache.cache_dir);
+
+        // Create a test 300x150 image
+        let img_path = temp_dir.join("test_img.png");
+        let mut img = RgbImage::new(300, 150);
+        for pixel in img.pixels_mut() {
+            *pixel = Rgb([50, 120, 200]);
+        }
+        img.save(&img_path).expect("Failed to save test image");
+
+        let mtime = fs::metadata(&img_path).unwrap().modified().unwrap();
+        let size = fs::metadata(&img_path).unwrap().len();
+
+        // 1st run: Generates thumbnail and writes .webp + .meta
+        let res1 = cache.load_or_generate_thumbnail(&img_path, mtime, size, 100);
+        assert!(res1.is_some());
+        let (ow1, oh1, color_img1) = res1.unwrap();
+        assert_eq!(ow1, 300, "Original width must be 300");
+        assert_eq!(oh1, 150, "Original height must be 150");
+        assert!(color_img1.width() <= 100, "Thumbnail width should be clamped to max_size");
+
+        // 2nd run: Loads from cache, must STILL return original dimensions
+        let res2 = cache.load_or_generate_thumbnail(&img_path, mtime, size, 100);
+        assert!(res2.is_some());
+        let (ow2, oh2, color_img2) = res2.unwrap();
+        assert_eq!(ow2, 300, "Cached load must report original width 300");
+        assert_eq!(oh2, 150, "Cached load must report original height 150");
+        assert_eq!(color_img1.width(), color_img2.width());
+        assert_eq!(color_img1.height(), color_img2.height());
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }

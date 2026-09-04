@@ -74,3 +74,85 @@ pub fn scan_directory<P: AsRef<Path>>(root: P) -> (Vec<ImageEntry>, Vec<(String,
 
     (entries, folders)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::{self, File};
+    use std::io::Write;
+
+    #[test]
+    fn test_is_image_ext() {
+        assert!(is_image_ext("jpg"));
+        assert!(is_image_ext("JPG"));
+        assert!(is_image_ext("jpeg"));
+        assert!(is_image_ext("Jpeg"));
+        assert!(is_image_ext("png"));
+        assert!(is_image_ext("PNG"));
+        assert!(is_image_ext("webp"));
+        assert!(is_image_ext("WebP"));
+        assert!(is_image_ext("bmp"));
+        assert!(is_image_ext("gif"));
+
+        assert!(!is_image_ext("txt"));
+        assert!(!is_image_ext("pdf"));
+        assert!(!is_image_ext("exe"));
+        assert!(!is_image_ext("mp4"));
+        assert!(!is_image_ext("json"));
+        assert!(!is_image_ext(""));
+    }
+
+    #[test]
+    fn test_scan_directory_structure() {
+        let temp_dir = std::env::temp_dir().join(format!("omniview_scan_test_{}", std::process::id()));
+        let _ = fs::create_dir_all(&temp_dir);
+
+        // Root images
+        let mut f1 = File::create(temp_dir.join("root1.png")).unwrap();
+        f1.write_all(b"fake png data").unwrap();
+        let mut f2 = File::create(temp_dir.join("root2.jpg")).unwrap();
+        f2.write_all(b"fake jpg data").unwrap();
+        let mut non_img = File::create(temp_dir.join("notes.txt")).unwrap();
+        non_img.write_all(b"text file").unwrap();
+
+        // Subdirectory 1: chapter_1 (3 images)
+        let ch1 = temp_dir.join("chapter_1");
+        fs::create_dir_all(&ch1).unwrap();
+        File::create(ch1.join("01.png")).unwrap().write_all(b"img1").unwrap();
+        File::create(ch1.join("02.webp")).unwrap().write_all(b"img2").unwrap();
+        File::create(ch1.join("03.jpg")).unwrap().write_all(b"img3").unwrap();
+
+        // Subdirectory 2: chapter_2 (1 image)
+        let ch2 = temp_dir.join("chapter_2");
+        fs::create_dir_all(&ch2).unwrap();
+        File::create(ch2.join("cover.gif")).unwrap().write_all(b"cover").unwrap();
+
+        // Hidden folder: .git (should be ignored)
+        let hidden = temp_dir.join(".git");
+        fs::create_dir_all(&hidden).unwrap();
+        File::create(hidden.join("ignored.png")).unwrap().write_all(b"ignored").unwrap();
+
+        let (entries, folders) = scan_directory(&temp_dir);
+
+        // Total scanned images should be 2 (root) + 3 (ch1) + 1 (ch2) = 6
+        assert_eq!(entries.len(), 6, "Must find exactly 6 image files");
+
+        // Folders list must have chapter_1 (3), __root__ (2), chapter_2 (1)
+        assert_eq!(folders.len(), 3);
+        assert_eq!(folders[0], ("chapter_1".to_string(), 3));
+        assert_eq!(folders[1], ("__root__".to_string(), 2));
+        assert_eq!(folders[2], ("chapter_2".to_string(), 1));
+
+        // Verify root entry subfolder name
+        let root_entries: Vec<_> = entries.iter().filter(|e| e.subfolder == "__root__").collect();
+        assert_eq!(root_entries.len(), 2);
+
+        // Verify file sizes are correct
+        for e in &entries {
+            assert!(e.file_size > 0, "File size must be positive");
+            assert!(!e.filename.is_empty(), "Filename must not be empty");
+        }
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+}

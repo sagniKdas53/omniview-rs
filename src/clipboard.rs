@@ -191,6 +191,10 @@ fn find_dragon_binary() -> Option<PathBuf> {
     None
 }
 
+extern "C" {
+    fn xdnd_start_drag_uris(uris: *const *const std::os::raw::c_char, count: std::os::raw::c_int) -> std::os::raw::c_int;
+}
+
 /// Starts an interactive Linux drag-and-drop session to drag files into Discord, Slack, etc.
 pub fn start_drag_files<P: AsRef<Path>>(paths: &[P]) {
     if paths.is_empty() {
@@ -211,7 +215,24 @@ pub fn start_drag_files<P: AsRef<Path>>(paths: &[P]) {
     // Ensure files are also ready on clipboard for instant Ctrl+V pasting into apps
     copy_files_uris(paths);
 
-    // Try dragon utility with compact, auto-exit mode
+    // 1. First priority: DIRECT NATIVE X11 XDND DRAG!
+    // Executes synchronously right from the button click without opening any intermediate window!
+    let c_strings: Vec<std::ffi::CString> = file_args
+        .iter()
+        .filter_map(|p| std::ffi::CString::new(format!("file://{}", p)).ok())
+        .collect();
+
+    if !c_strings.is_empty() {
+        let c_ptrs: Vec<*const std::os::raw::c_char> = c_strings.iter().map(|s| s.as_ptr()).collect();
+        let res = unsafe {
+            xdnd_start_drag_uris(c_ptrs.as_ptr(), c_ptrs.len() as std::os::raw::c_int)
+        };
+        if res != 0 {
+            return;
+        }
+    }
+
+    // 2. Fallback: dragon utility with compact, auto-exit mode
     if let Some(dragon_path) = find_dragon_binary() {
         let mut cmd = Command::new(dragon_path);
         // -x: exit immediately after a single completed drop
@@ -229,7 +250,7 @@ pub fn start_drag_files<P: AsRef<Path>>(paths: &[P]) {
         }
     }
 
-    // Fallback: Python PyQt5 drag helper
+    // 3. Fallback: Python PyQt5 drag helper
     let py_script = r#"
 import sys
 from PyQt5.QtWidgets import QApplication, QWidget

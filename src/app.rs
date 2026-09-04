@@ -332,7 +332,16 @@ impl OmniViewApp {
                             if ui.button("📋 Copy Path").clicked() {
                                 copy_text(&entry.path.to_string_lossy());
                             }
-                            if ui.button(egui::RichText::new("📤 Drag to Attach").strong()).clicked() {
+                            let drag_btn = ui.add(
+                                egui::Button::new(
+                                    egui::RichText::new("📤 Drag to Attach")
+                                        .color(Color32::WHITE)
+                                        .strong()
+                                )
+                                .fill(Color32::from_rgb(79, 70, 229))
+                                .sense(egui::Sense::click_and_drag())
+                            );
+                            if drag_btn.drag_started() || drag_btn.clicked() {
                                 start_drag_files(&[entry.path.clone()]);
                             }
                             if ui.button(egui::RichText::new("📁 Copy File (Attach)").strong()).clicked() {
@@ -588,9 +597,18 @@ impl eframe::App for OmniViewApp {
 
                         let selected_vec: Vec<PathBuf> = self.selected_paths.iter().cloned().collect();
 
-                        // Drag & Drop
-                        let drag_btn = ui.add_enabled(count > 0, egui::Button::new(format!("📤 Drag & Drop ({})", count)));
-                        if drag_btn.clicked() {
+                        // Dedicated Drag to Attach button on main window!
+                        let drag_btn = ui.add_enabled(
+                            count > 0,
+                            egui::Button::new(
+                                egui::RichText::new(format!("📤 Drag to Attach ({})", count))
+                                    .color(Color32::WHITE)
+                                    .strong()
+                            )
+                            .fill(Color32::from_rgb(79, 70, 229))
+                            .sense(egui::Sense::click_and_drag())
+                        );
+                        if drag_btn.drag_started() || drag_btn.clicked() {
                             start_drag_files(&selected_vec);
                         }
 
@@ -701,21 +719,11 @@ impl eframe::App for OmniViewApp {
 
                                     let is_selected = self.selected_paths.contains(&entry.path);
 
-                                    // Allocate interactive card rect with click & drag sensing
+                                    // Interactive card: click to select or open (no accidental dragging)
                                     let (card_rect, card_resp) = ui.allocate_exact_size(
                                         Vec2::new(card_w, card_h),
-                                        egui::Sense::click_and_drag(),
+                                        egui::Sense::click(),
                                     );
-
-                                    // Drag-and-drop initiation!
-                                    if card_resp.drag_started() {
-                                        if is_selected && self.selected_paths.len() > 1 {
-                                            let files: Vec<PathBuf> = self.selected_paths.iter().cloned().collect();
-                                            start_drag_files(&files);
-                                        } else {
-                                            start_drag_files(&[entry.path.clone()]);
-                                        }
-                                    }
 
                                     // Click handling: toggle select if select mode or Ctrl, else open viewer
                                     if card_resp.clicked() {

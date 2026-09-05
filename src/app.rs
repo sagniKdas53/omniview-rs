@@ -258,7 +258,6 @@ impl OmniViewApp {
         let mut nav_prev = false;
         let mut toggle_fit = false;
 
-        let title = format!("{} — OmniView Viewer ({} / {})", entry.filename, curr_idx + 1, total_in_view);
 
         let active_tex_clone = self.viewer_texture.as_ref()
             .map(|(_, tex)| tex.clone())
@@ -268,14 +267,15 @@ impl OmniViewApp {
         let mut viewer_zoom = self.viewer_zoom;
         let mut viewer_is_fit = self.viewer_is_fit;
         let dark_mode = self.dark_mode;
+        let title = format!("{} — OmniView RS Viewer ({} / {})", entry.filename, curr_idx + 1, total_in_view);
 
         ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of("omniview_viewer_subwindow"),
+            egui::ViewportId::from_hash_of("omniview_rs_viewer_subwindow"),
             egui::ViewportBuilder::default()
                 .with_title(&title)
                 .with_inner_size([1150.0, 860.0])
                 .with_min_inner_size([640.0, 480.0])
-                .with_app_id("omniview-viewer"),
+                .with_app_id("omniview-rs-viewer"),
             |sub_ctx, _class| {
                 if dark_mode {
                     sub_ctx.set_visuals(egui::Visuals::dark());

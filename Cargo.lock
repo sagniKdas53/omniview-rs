@@ -2457,7 +2457,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "omniview"
+name = "omniview-rs"
 version = "1.0.0"
 dependencies = [
  "arboard",

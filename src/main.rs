@@ -25,13 +25,13 @@ fn main() -> eframe::Result<()> {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1360.0, 860.0])
             .with_min_inner_size([720.0, 480.0])
-            .with_title("OmniView - High Performance Image Gallery")
-            .with_app_id("omniview"),
+            .with_title("OmniView RS - Standalone Rust Image Gallery")
+            .with_app_id("omniview-rs"),
         ..Default::default()
     };
 
     eframe::run_native(
-        "OmniView",
+        "OmniView RS",
         native_options,
         Box::new(|_cc| Ok(Box::new(OmniViewApp::new(initial_dir)))),
     )

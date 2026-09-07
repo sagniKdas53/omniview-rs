@@ -1,7 +1,12 @@
 mod app;
 mod cache;
 mod clipboard;
+mod color_utils;
+mod db;
+mod models;
+mod natural_sort;
 mod scanner;
+mod statx;
 mod watcher;
 
 use app::OmniViewApp;

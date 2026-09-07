@@ -1,62 +1,56 @@
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use eframe::egui::{self, Color32, ColorImage, Key, Pos2, Rect, CornerRadius, Stroke, TextureHandle, TextureOptions, Vec2};
+use rand::seq::SliceRandom;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-
 
 use crate::cache::ThumbnailCache;
 use crate::clipboard::{
     copy_file_uri, copy_files_uris, copy_image_bitmap, copy_multiple_paths,
     copy_text, open_in_default_app, reveal_in_file_manager, start_drag_files,
 };
-use crate::scanner::{scan_directory, ImageEntry};
+use crate::color_utils::{hamming_distance, COLOR_PALETTE};
+use crate::db::{Database, QueryFilter, Stats};
+use crate::models::{AspectFilter, ImageRecord, SortMode};
+use crate::natural_sort::compare_natural;
+use crate::scanner::scan_directory;
 use crate::watcher::FolderWatcher;
-
-#[derive(PartialEq, Clone, Copy)]
-pub enum AspectFilter {
-    All,
-    Portrait,
-    Landscape,
-    Square,
-}
-
-#[derive(PartialEq, Clone, Copy)]
-pub enum SortMode {
-    Newest,
-    Oldest,
-    SizeDesc,
-    SizeAsc,
-    NameAsc,
-}
 
 pub struct OmniViewApp {
     pub current_dir: PathBuf,
-    pub all_entries: Vec<ImageEntry>,
+    pub all_entries: Vec<ImageRecord>,
     pub subfolders: Vec<(String, usize)>,
     pub selected_subfolder: Option<String>,
+    pub selected_color: Option<String>,
+    pub similarity_target_dhash: Option<(String, String)>,
     pub folder_search: String,
     pub search_term: String,
     pub aspect_filter: AspectFilter,
     pub sort_mode: SortMode,
     pub card_size: f32,
     pub dark_mode: bool,
+    pub is_favorite_filter: bool,
+    pub favorites_count: usize,
 
     // Batch Selection Mode
     pub select_mode: bool,
     pub selected_paths: HashSet<PathBuf>,
 
-    // Caching & Async
+    // Database & Caching
+    pub db: Arc<Database>,
     pub cache: Arc<ThumbnailCache>,
     pub textures: HashMap<PathBuf, TextureHandle>,
     pub pending_requests: HashSet<PathBuf>,
     pub thumb_tx: Sender<(PathBuf, u32, u32, ColorImage)>,
     pub thumb_rx: Receiver<(PathBuf, u32, u32, ColorImage)>,
 
-    // Live watching
+    // Live watching & background scan
     pub watcher: Option<FolderWatcher>,
     pub watcher_rx: Receiver<()>,
     pub watcher_tx: Sender<()>,
+    pub bg_scan_rx: Receiver<()>,
+    pub bg_scan_tx: Sender<()>,
 
     // Lightbox / Fullscreen Viewer
     pub viewing_index: Option<usize>,
@@ -73,23 +67,30 @@ impl OmniViewApp {
     pub fn new(initial_dir: PathBuf) -> Self {
         let (thumb_tx, thumb_rx) = unbounded();
         let (watcher_tx, watcher_rx) = unbounded();
+        let (bg_scan_tx, bg_scan_rx) = unbounded();
         let cache = Arc::new(ThumbnailCache::new());
+        let db = Arc::new(Database::default_db());
 
         let mut app = Self {
             current_dir: initial_dir.clone(),
             all_entries: Vec::new(),
             subfolders: Vec::new(),
             selected_subfolder: None,
+            selected_color: None,
+            similarity_target_dhash: None,
             folder_search: String::new(),
             search_term: String::new(),
             aspect_filter: AspectFilter::All,
-            sort_mode: SortMode::Newest,
+            sort_mode: SortMode::ModifiedNewest,
             card_size: 220.0,
             dark_mode: true,
+            is_favorite_filter: false,
+            favorites_count: 0,
 
             select_mode: false,
             selected_paths: HashSet::new(),
 
+            db,
             cache,
             textures: HashMap::new(),
             pending_requests: HashSet::new(),
@@ -99,6 +100,8 @@ impl OmniViewApp {
             watcher: None,
             watcher_rx,
             watcher_tx,
+            bg_scan_rx,
+            bg_scan_tx,
 
             viewing_index: None,
             viewer_texture: None,
@@ -118,26 +121,121 @@ impl OmniViewApp {
         self.textures.clear();
         self.pending_requests.clear();
         self.selected_paths.clear();
+        self.selected_subfolder = None;
+        self.selected_color = None;
+        self.similarity_target_dhash = None;
+        self.is_favorite_filter = false;
         self.viewing_index = None;
         self.viewer_texture = None;
 
-        // Perform scan
-        let (entries, folders) = scan_directory(&dir);
-        self.total_bytes = entries.iter().map(|e| e.file_size).sum();
-        self.all_entries = entries;
-        self.subfolders = folders;
-        self.selected_subfolder = None;
+        let dir_str = dir.to_string_lossy().to_string();
+        self.subfolders = self.db.get_subfolders_with_counts(&dir_str).unwrap_or_default();
+        let stats = self.db.get_stats().unwrap_or(Stats {
+            total_images: 0,
+            total_bytes: 0,
+            favorites_count: 0,
+            indexed_count: 0,
+        });
+        self.favorites_count = stats.favorites_count;
+        self.total_bytes = stats.total_bytes;
 
-        // Start filesystem watcher
+        let filter = QueryFilter {
+            root_dir: dir_str.clone(),
+            subfolder: None,
+            color_name: None,
+            aspect_type: AspectFilter::All,
+            search_term: String::new(),
+            favorite_only: false,
+            sort_by: self.sort_mode,
+        };
+        self.all_entries = self.db.query_images(&filter).unwrap_or_default();
+
         let tx = self.watcher_tx.clone();
         self.watcher = FolderWatcher::new(&dir, tx).ok();
+
+        self.rescan_background();
     }
 
     pub fn rescan(&mut self) {
-        let (entries, folders) = scan_directory(&self.current_dir);
-        self.total_bytes = entries.iter().map(|e| e.file_size).sum();
-        self.all_entries = entries;
-        self.subfolders = folders;
+        let (records, _folders, _total_bytes) = scan_directory(&self.current_dir);
+        if !records.is_empty() {
+            let _ = self.db.batch_sync_files(&records);
+        }
+        self.reload_from_db();
+        self.rescan_background();
+    }
+
+    pub fn reload_from_db(&mut self) {
+        let dir_str = self.current_dir.to_string_lossy().to_string();
+        self.subfolders = self.db.get_subfolders_with_counts(&dir_str).unwrap_or_default();
+        let stats = self.db.get_stats().unwrap_or(Stats {
+            total_images: 0,
+            total_bytes: 0,
+            favorites_count: 0,
+            indexed_count: 0,
+        });
+        self.favorites_count = stats.favorites_count;
+        self.total_bytes = stats.total_bytes;
+
+        let filter = QueryFilter {
+            root_dir: dir_str.clone(),
+            subfolder: self.selected_subfolder.clone(),
+            color_name: self.selected_color.clone(),
+            aspect_type: self.aspect_filter,
+            search_term: self.search_term.clone(),
+            favorite_only: self.is_favorite_filter,
+            sort_by: self.sort_mode,
+        };
+        self.all_entries = self.db.query_images(&filter).unwrap_or_default();
+    }
+
+    pub fn rescan_background(&self) {
+        let dir = self.current_dir.clone();
+        let dir_str = dir.to_string_lossy().to_string();
+        let db = Arc::clone(&self.db);
+        let cache = Arc::clone(&self.cache);
+        let bg_tx = self.bg_scan_tx.clone();
+
+        std::thread::spawn(move || {
+            use rayon::prelude::*;
+            let existing_subfolders = db.get_subfolders_with_counts(&dir_str).unwrap_or_default();
+            if existing_subfolders.is_empty() {
+                let (records, _, _) = scan_directory(&dir);
+                if !records.is_empty() {
+                    let _ = db.batch_sync_files(&records);
+                    let _ = bg_tx.send(());
+                }
+            }
+
+            if let Ok(unindexed) = db.get_unindexed_paths(&dir_str) {
+                if !unindexed.is_empty() {
+                    let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build();
+                    if let Ok(pool) = pool {
+                        pool.install(|| {
+                            unindexed.into_par_iter().for_each(|(path_str, _, _)| {
+                                if let Some((thumb_path, w, h, aspect, color, r, g, b, dhash)) =
+                                    cache.process_image_features(&path_str, 380)
+                                {
+                                    let _ = db.update_metadata(
+                                        &path_str,
+                                        w,
+                                        h,
+                                        aspect,
+                                        color,
+                                        r,
+                                        g,
+                                        b,
+                                        &dhash,
+                                        &thumb_path.to_string_lossy(),
+                                    );
+                                }
+                            });
+                        });
+                        let _ = bg_tx.send(());
+                    }
+                }
+            }
+        });
     }
 
     pub fn get_filtered_indices(&self) -> Vec<usize> {
@@ -145,14 +243,22 @@ impl OmniViewApp {
             .filter(|&i| {
                 let entry = &self.all_entries[i];
 
-                // Subfolder filter
+                if self.is_favorite_filter && !entry.is_favorite {
+                    return false;
+                }
+
                 if let Some(ref sub) = self.selected_subfolder {
                     if &entry.subfolder != sub {
                         return false;
                     }
                 }
 
-                // Search term filter
+                if let Some(ref col) = self.selected_color {
+                    if col != "all" && &entry.color_name != col {
+                        return false;
+                    }
+                }
+
                 if !self.search_term.is_empty() {
                     let term = self.search_term.to_lowercase();
                     if !entry.filename.to_lowercase().contains(&term)
@@ -162,47 +268,61 @@ impl OmniViewApp {
                     }
                 }
 
-                // Aspect ratio filter (if dimensions are known)
-                if entry.width > 0 && entry.height > 0 {
-                    let ratio = entry.width as f32 / entry.height as f32;
-                    match self.aspect_filter {
-                        AspectFilter::All => true,
-                        AspectFilter::Portrait => ratio < 0.85,
-                        AspectFilter::Landscape => ratio > 1.18,
-                        AspectFilter::Square => ratio >= 0.85 && ratio <= 1.18,
-                    }
-                } else {
-                    true
+                match self.aspect_filter {
+                    AspectFilter::All => true,
+                    AspectFilter::Portrait => entry.aspect == AspectFilter::Portrait,
+                    AspectFilter::Landscape => entry.aspect == AspectFilter::Landscape,
+                    AspectFilter::Square => entry.aspect == AspectFilter::Square,
                 }
             })
             .collect();
 
-        // Sorting
+        if let Some((ref target_hash, _)) = self.similarity_target_dhash {
+            indices.retain(|&i| {
+                let dhash = &self.all_entries[i].dhash;
+                if dhash.is_empty() {
+                    false
+                } else {
+                    hamming_distance(target_hash, dhash) <= 16
+                }
+            });
+            indices.sort_by_key(|&i| {
+                hamming_distance(target_hash, &self.all_entries[i].dhash)
+            });
+            return indices;
+        }
+
         match self.sort_mode {
-            SortMode::Newest => indices.sort_by(|&a, &b| self.all_entries[b].mtime.cmp(&self.all_entries[a].mtime)),
-            SortMode::Oldest => indices.sort_by(|&a, &b| self.all_entries[a].mtime.cmp(&self.all_entries[b].mtime)),
-            SortMode::SizeDesc => indices.sort_by(|&a, &b| self.all_entries[b].file_size.cmp(&self.all_entries[a].file_size)),
-            SortMode::SizeAsc => indices.sort_by(|&a, &b| self.all_entries[a].file_size.cmp(&self.all_entries[b].file_size)),
-            SortMode::NameAsc => indices.sort_by(|&a, &b| self.all_entries[a].filename.cmp(&self.all_entries[b].filename)),
+            SortMode::ModifiedNewest => indices.sort_by(|&a, &b| self.all_entries[b].mtime.total_cmp(&self.all_entries[a].mtime)),
+            SortMode::ModifiedOldest => indices.sort_by(|&a, &b| self.all_entries[a].mtime.total_cmp(&self.all_entries[b].mtime)),
+            SortMode::CreatedNewest => indices.sort_by(|&a, &b| self.all_entries[b].ctime.total_cmp(&self.all_entries[a].ctime)),
+            SortMode::CreatedOldest => indices.sort_by(|&a, &b| self.all_entries[a].ctime.total_cmp(&self.all_entries[b].ctime)),
+            SortMode::SizeLargest => indices.sort_by(|&a, &b| self.all_entries[b].file_size.cmp(&self.all_entries[a].file_size)),
+            SortMode::SizeSmallest => indices.sort_by(|&a, &b| self.all_entries[a].file_size.cmp(&self.all_entries[b].file_size)),
+            SortMode::NameAsc => indices.sort_by(|&a, &b| compare_natural(&self.all_entries[a].filename, &self.all_entries[b].filename)),
+            SortMode::NameDesc => indices.sort_by(|&a, &b| compare_natural(&self.all_entries[b].filename, &self.all_entries[a].filename)),
+            SortMode::Random => {
+                let mut rng = rand::thread_rng();
+                indices.shuffle(&mut rng);
+            }
         }
 
         indices
     }
 
-    fn request_thumbnail(&mut self, entry: &ImageEntry) {
+    fn request_thumbnail(&mut self, entry: &ImageRecord) {
         if self.pending_requests.contains(&entry.path) {
             return;
         }
         self.pending_requests.insert(entry.path.clone());
 
         let path = entry.path.clone();
-        let mtime = entry.mtime;
-        let file_size = entry.file_size;
+        let thumb_path = entry.thumb_path.clone();
         let cache = Arc::clone(&self.cache);
         let tx = self.thumb_tx.clone();
 
         rayon::spawn(move || {
-            if let Some((w, h, color_img)) = cache.load_or_generate_thumbnail(&path, mtime, file_size, 340) {
+            if let Some((w, h, color_img)) = cache.load_thumbnail(&path, Some(&thumb_path), 380) {
                 let _ = tx.send((path, w, h, color_img));
             }
         });
@@ -465,6 +585,18 @@ impl OmniViewApp {
     }
 }
 
+fn parse_hex_color(hex: &str) -> Color32 {
+    let hex = hex.trim_start_matches('#');
+    if hex.len() == 6 {
+        let r = u8::from_str_radix(&hex[0..2], 16).unwrap_or(128);
+        let g = u8::from_str_radix(&hex[2..4], 16).unwrap_or(128);
+        let b = u8::from_str_radix(&hex[4..6], 16).unwrap_or(128);
+        Color32::from_rgb(r, g, b)
+    } else {
+        Color32::GRAY
+    }
+}
+
 impl eframe::App for OmniViewApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Apply Dark / Light Mode
@@ -479,8 +611,43 @@ impl eframe::App for OmniViewApp {
             self.rescan();
         }
 
+        // Background scan complete event
+        if self.bg_scan_rx.try_recv().is_ok() {
+            self.reload_from_db();
+        }
+
         // Receive loaded thumbnails
         self.update_pending_thumbnails(ctx);
+
+        // Similarity Banner (if active)
+        let sim_filename = self.similarity_target_dhash.as_ref().map(|(_, fn_)| fn_.clone());
+        if let Some(filename) = sim_filename {
+            let mut clear_sim = false;
+            egui::TopBottomPanel::top("similarity_banner")
+                .frame(
+                    egui::Frame::side_top_panel(ctx.style().as_ref())
+                        .fill(Color32::from_rgb(49, 46, 129))
+                )
+                .show(ctx, |ui| {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("🎯 Showing images visually similar to \"{}\"", filename))
+                                .color(Color32::WHITE)
+                                .strong(),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("✕ Clear Similarity").clicked() {
+                                clear_sim = true;
+                            }
+                        });
+                    });
+                    ui.add_space(4.0);
+                });
+            if clear_sim {
+                self.similarity_target_dhash = None;
+            }
+        }
 
         // 1. Top Panel
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
@@ -506,21 +673,29 @@ impl eframe::App for OmniViewApp {
                 ui.label("Card Size:");
                 ui.add(egui::Slider::new(&mut self.card_size, 110.0..=450.0).show_value(false));
 
-                // Sort Mode
+                // 9 Sort Modes
                 egui::ComboBox::from_id_salt("sort_mode")
                     .selected_text(match self.sort_mode {
-                        SortMode::Newest => "Newest First",
-                        SortMode::Oldest => "Oldest First",
-                        SortMode::SizeDesc => "Size (Large)",
-                        SortMode::SizeAsc => "Size (Small)",
-                        SortMode::NameAsc => "Name (A-Z)",
+                        SortMode::ModifiedNewest => "Date Modified (Newest)",
+                        SortMode::ModifiedOldest => "Date Modified (Oldest)",
+                        SortMode::CreatedNewest => "Date Created (Newest)",
+                        SortMode::CreatedOldest => "Date Created (Oldest)",
+                        SortMode::NameAsc => "Name (A-Z Natural)",
+                        SortMode::NameDesc => "Name (Z-A Natural)",
+                        SortMode::SizeLargest => "Size (Largest)",
+                        SortMode::SizeSmallest => "Size (Smallest)",
+                        SortMode::Random => "🎲 Random Shuffle",
                     })
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.sort_mode, SortMode::Newest, "Newest First");
-                        ui.selectable_value(&mut self.sort_mode, SortMode::Oldest, "Oldest First");
-                        ui.selectable_value(&mut self.sort_mode, SortMode::SizeDesc, "Size (Large)");
-                        ui.selectable_value(&mut self.sort_mode, SortMode::SizeAsc, "Size (Small)");
-                        ui.selectable_value(&mut self.sort_mode, SortMode::NameAsc, "Name (A-Z)");
+                        ui.selectable_value(&mut self.sort_mode, SortMode::ModifiedNewest, "Date Modified (Newest)");
+                        ui.selectable_value(&mut self.sort_mode, SortMode::ModifiedOldest, "Date Modified (Oldest)");
+                        ui.selectable_value(&mut self.sort_mode, SortMode::CreatedNewest, "Date Created (Newest)");
+                        ui.selectable_value(&mut self.sort_mode, SortMode::CreatedOldest, "Date Created (Oldest)");
+                        ui.selectable_value(&mut self.sort_mode, SortMode::NameAsc, "Name (A-Z Natural)");
+                        ui.selectable_value(&mut self.sort_mode, SortMode::NameDesc, "Name (Z-A Natural)");
+                        ui.selectable_value(&mut self.sort_mode, SortMode::SizeLargest, "Size (Largest)");
+                        ui.selectable_value(&mut self.sort_mode, SortMode::SizeSmallest, "Size (Smallest)");
+                        ui.selectable_value(&mut self.sort_mode, SortMode::Random, "🎲 Random Shuffle");
                     });
 
                 // Rescan Button
@@ -558,8 +733,31 @@ impl eframe::App for OmniViewApp {
             ui.add_space(4.0);
             ui.separator();
 
-            // Aspect Filter & Status Row
+            // Color Palette Row & Aspect Filter Row
             ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Colors:").strong());
+                for &(name, label, hex) in COLOR_PALETTE {
+                    let is_sel = self.selected_color.as_deref() == Some(name)
+                        || (name == "all" && self.selected_color.is_none());
+                    let btn_color = parse_hex_color(hex);
+                    let btn_text = if is_sel { format!("• {} •", label) } else { label.to_string() };
+                    let mut btn = egui::Button::new(egui::RichText::new(btn_text).size(11.0).color(
+                        if name == "white" { Color32::BLACK } else { Color32::WHITE }
+                    ));
+                    if is_sel {
+                        btn = btn.stroke(Stroke::new(2.0_f32, Color32::WHITE));
+                    }
+                    btn = btn.fill(btn_color);
+                    if ui.add(btn).clicked() {
+                        if name == "all" || self.selected_color.as_deref() == Some(name) {
+                            self.selected_color = None;
+                        } else {
+                            self.selected_color = Some(name.to_string());
+                        }
+                    }
+                }
+
+                ui.add_space(10.0);
                 ui.label(egui::RichText::new("Aspect:").strong());
                 ui.selectable_value(&mut self.aspect_filter, AspectFilter::All, "All");
                 ui.selectable_value(&mut self.aspect_filter, AspectFilter::Portrait, "📱 Portrait");
@@ -659,18 +857,26 @@ impl eframe::App for OmniViewApp {
 
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     // All Images Button
-                    let is_all_selected = self.selected_subfolder.is_none();
+                    let is_all_selected = self.selected_subfolder.is_none() && !self.is_favorite_filter;
                     let all_text = format!("🖼️ All Images ({})", self.all_entries.len());
                     if ui.selectable_label(is_all_selected, all_text).clicked() {
                         self.selected_subfolder = None;
+                        self.is_favorite_filter = false;
+                    }
+
+                    // Favorites Button
+                    let fav_text = format!("⭐ Favorites ({})", self.favorites_count);
+                    if ui.selectable_label(self.is_favorite_filter, fav_text).clicked() {
+                        self.selected_subfolder = None;
+                        self.is_favorite_filter = !self.is_favorite_filter;
                     }
 
                     ui.separator();
 
                     let filter_term = self.folder_search.to_lowercase();
                     for (folder, count) in &self.subfolders {
-                        let label_name = if folder == "__root__" {
-                            format!("📁 Root ({})", count)
+                        let label_name = if folder.is_empty() || folder == "__root__" {
+                            format!("📁 [root] ({})", count)
                         } else {
                             format!("📁 {} ({})", folder, count)
                         };
@@ -679,9 +885,10 @@ impl eframe::App for OmniViewApp {
                             continue;
                         }
 
-                        let is_selected = self.selected_subfolder.as_ref() == Some(folder);
+                        let is_selected = !self.is_favorite_filter && self.selected_subfolder.as_ref() == Some(folder);
                         if ui.selectable_label(is_selected, label_name).clicked() {
                             self.selected_subfolder = Some(folder.clone());
+                            self.is_favorite_filter = false;
                         }
                     }
                 });
@@ -798,6 +1005,18 @@ impl eframe::App for OmniViewApp {
                                         );
                                     }
 
+                                    // Star indicator if favorite
+                                    if entry.is_favorite {
+                                        let star_pos = Pos2::new(card_rect.max.x - 22.0, card_rect.min.y + 6.0);
+                                        ui.painter().text(
+                                            star_pos,
+                                            egui::Align2::RIGHT_TOP,
+                                            "⭐",
+                                            egui::FontId::proportional(14.0),
+                                            Color32::WHITE,
+                                        );
+                                    }
+
                                     // Batch Selection Checkbox Indicator
                                     if self.select_mode || is_selected {
                                         let check_box_rect = Rect::from_min_size(card_rect.min + Vec2::new(8.0, 8.0), Vec2::new(20.0, 20.0));
@@ -846,6 +1065,39 @@ impl eframe::App for OmniViewApp {
                                             self.viewing_index = Some(item_idx_in_filtered);
                                             ui.close_menu();
                                         }
+
+                                        let path_str = entry.path.to_string_lossy().to_string();
+                                        let is_fav = entry.is_favorite;
+                                        let fav_lbl = if is_fav { "⭐ Remove Favorite" } else { "⭐ Add to Favorites" };
+                                        if ui.button(fav_lbl).clicked() {
+                                            let _ = self.db.toggle_favorite(&path_str);
+                                            if let Some(item) = self.all_entries.iter_mut().find(|e| e.path == entry.path) {
+                                                item.is_favorite = !is_fav;
+                                            }
+                                            if is_fav {
+                                                self.favorites_count = self.favorites_count.saturating_sub(1);
+                                            } else {
+                                                self.favorites_count += 1;
+                                            }
+                                            ui.close_menu();
+                                        }
+
+                                        if !entry.dhash.is_empty() {
+                                            if ui.button("🎯 Find Visually Similar").clicked() {
+                                                self.similarity_target_dhash = Some((entry.dhash.clone(), entry.filename.clone()));
+                                                ui.close_menu();
+                                            }
+                                        }
+
+                                        if !entry.subfolder.is_empty() {
+                                            let sub = entry.subfolder.clone();
+                                            if ui.button(format!("📂 Show Folder: {}", sub)).clicked() {
+                                                self.selected_subfolder = Some(sub);
+                                                self.is_favorite_filter = false;
+                                                ui.close_menu();
+                                            }
+                                        }
+
                                         if ui.button("📤 Drag to Share / Attach").clicked() {
                                             if is_selected && self.selected_paths.len() > 1 {
                                                 let files: Vec<PathBuf> = self.selected_paths.iter().cloned().collect();
@@ -879,12 +1131,6 @@ impl eframe::App for OmniViewApp {
                                             copy_image_bitmap(&entry.path);
                                             ui.close_menu();
                                         }
-                                        ui.separator();
-                                        let sub = entry.subfolder.clone();
-                                        if ui.button(format!("📂 Show Folder: {}", sub)).clicked() {
-                                            self.selected_subfolder = Some(sub);
-                                            ui.close_menu();
-                                        }
                                         if ui.button("↗️ Open in Default Viewer").clicked() {
                                             open_in_default_app(&entry.path);
                                             ui.close_menu();
@@ -909,33 +1155,52 @@ impl eframe::App for OmniViewApp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, SystemTime};
 
-    fn make_test_entry(name: &str, sub: &str, size: u64, w: u32, h: u32, secs_ago: u64) -> ImageEntry {
-        ImageEntry {
+    fn make_test_entry(
+        name: &str,
+        sub: &str,
+        size: u64,
+        w: u32,
+        h: u32,
+        mtime: f64,
+        ctime: f64,
+        aspect: AspectFilter,
+        color_name: &str,
+        is_favorite: bool,
+    ) -> ImageRecord {
+        ImageRecord {
             path: PathBuf::from(format!("/fake/{}/{}", sub, name)),
             filename: name.to_string(),
             subfolder: sub.to_string(),
             file_size: size,
-            mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000 - secs_ago),
+            mtime,
+            ctime,
             width: w,
             height: h,
+            thumb_path: PathBuf::from(format!("/fake/thumb/{}.webp", name)),
+            is_favorite,
+            aspect,
+            color_name: color_name.to_string(),
+            dhash: String::new(),
         }
     }
 
     fn create_test_app() -> OmniViewApp {
         let (thumb_tx, thumb_rx) = unbounded();
         let (watcher_tx, watcher_rx) = unbounded();
+        let (bg_scan_tx, bg_scan_rx) = unbounded();
         let cache = Arc::new(ThumbnailCache {
             cache_dir: PathBuf::from("/tmp/test_cache_app"),
+            legacy_cache_dir: PathBuf::from("/tmp/test_legacy_cache_app"),
         });
+        let db = Arc::new(Database::default_db());
 
         let entries = vec![
-            make_test_entry("portrait.png", "folder_a", 1000, 800, 1200, 10),  // ratio ~0.66 (Portrait)
-            make_test_entry("landscape.jpg", "folder_a", 5000, 1920, 1080, 50), // ratio ~1.77 (Landscape)
-            make_test_entry("square.webp", "folder_b", 2000, 1000, 1000, 20),  // ratio 1.0 (Square)
-            make_test_entry("zeta.png", "folder_b", 8000, 1600, 900, 100),     // Landscape, largest
-            make_test_entry("alpha.png", "folder_c", 500, 600, 900, 5),        // Portrait, smallest, newest
+            make_test_entry("portrait.png", "folder_a", 1000, 800, 1200, 1000.0, 900.0, AspectFilter::Portrait, "red", false),
+            make_test_entry("landscape.jpg", "folder_a", 5000, 1920, 1080, 500.0, 500.0, AspectFilter::Landscape, "blue", true),
+            make_test_entry("square.webp", "folder_b", 2000, 1000, 1000, 800.0, 700.0, AspectFilter::Square, "green", false),
+            make_test_entry("zeta.png", "folder_b", 8000, 1600, 900, 200.0, 100.0, AspectFilter::Landscape, "yellow", false),
+            make_test_entry("alpha.png", "folder_c", 500, 600, 900, 1200.0, 1100.0, AspectFilter::Portrait, "pink", true),
         ];
 
         OmniViewApp {
@@ -943,14 +1208,19 @@ mod tests {
             all_entries: entries,
             subfolders: vec![("folder_a".into(), 2), ("folder_b".into(), 2), ("folder_c".into(), 1)],
             selected_subfolder: None,
+            selected_color: None,
+            similarity_target_dhash: None,
             folder_search: String::new(),
             search_term: String::new(),
             aspect_filter: AspectFilter::All,
-            sort_mode: SortMode::Newest,
+            sort_mode: SortMode::ModifiedNewest,
             card_size: 220.0,
             dark_mode: true,
+            is_favorite_filter: false,
+            favorites_count: 2,
             select_mode: false,
             selected_paths: HashSet::new(),
+            db,
             cache,
             textures: HashMap::new(),
             pending_requests: HashSet::new(),
@@ -959,6 +1229,8 @@ mod tests {
             watcher: None,
             watcher_rx,
             watcher_tx,
+            bg_scan_rx,
+            bg_scan_tx,
             viewing_index: None,
             viewer_texture: None,
             viewer_zoom: 1.0,
@@ -987,6 +1259,23 @@ mod tests {
     }
 
     #[test]
+    fn test_filter_by_color_and_favorites() {
+        let mut app = create_test_app();
+
+        // Filter by color "red"
+        app.selected_color = Some("red".to_string());
+        let r_indices = app.get_filtered_indices();
+        assert_eq!(r_indices.len(), 1);
+        assert_eq!(app.all_entries[r_indices[0]].filename, "portrait.png");
+
+        // Filter by favorites only
+        app.selected_color = None;
+        app.is_favorite_filter = true;
+        let fav_indices = app.get_filtered_indices();
+        assert_eq!(fav_indices.len(), 2);
+    }
+
+    #[test]
     fn test_filter_by_search_term() {
         let mut app = create_test_app();
 
@@ -1006,17 +1295,17 @@ mod tests {
     fn test_filter_by_aspect_ratio() {
         let mut app = create_test_app();
 
-        // Portrait (< 0.85)
+        // Portrait
         app.aspect_filter = AspectFilter::Portrait;
         let p_indices = app.get_filtered_indices();
-        assert_eq!(p_indices.len(), 2); // portrait.png (800x1200) and alpha.png (600x900)
+        assert_eq!(p_indices.len(), 2);
 
-        // Landscape (> 1.18)
+        // Landscape
         app.aspect_filter = AspectFilter::Landscape;
         let l_indices = app.get_filtered_indices();
-        assert_eq!(l_indices.len(), 2); // landscape.jpg (1920x1080) and zeta.png (1600x900)
+        assert_eq!(l_indices.len(), 2);
 
-        // Square (0.85 .. 1.18)
+        // Square
         app.aspect_filter = AspectFilter::Square;
         let s_indices = app.get_filtered_indices();
         assert_eq!(s_indices.len(), 1);
@@ -1024,7 +1313,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sort_modes() {
+    fn test_all_sort_modes() {
         let mut app = create_test_app();
 
         // Name Ascending
@@ -1034,26 +1323,36 @@ mod tests {
         assert_eq!(names, vec!["alpha.png", "landscape.jpg", "portrait.png", "square.webp", "zeta.png"]);
 
         // Size Descending
-        app.sort_mode = SortMode::SizeDesc;
+        app.sort_mode = SortMode::SizeLargest;
         let indices = app.get_filtered_indices();
         let sizes: Vec<u64> = indices.iter().map(|&i| app.all_entries[i].file_size).collect();
         assert_eq!(sizes, vec![8000, 5000, 2000, 1000, 500]);
 
         // Size Ascending
-        app.sort_mode = SortMode::SizeAsc;
+        app.sort_mode = SortMode::SizeSmallest;
         let indices = app.get_filtered_indices();
         let sizes: Vec<u64> = indices.iter().map(|&i| app.all_entries[i].file_size).collect();
         assert_eq!(sizes, vec![500, 1000, 2000, 5000, 8000]);
 
-        // Newest First (smallest secs_ago)
-        app.sort_mode = SortMode::Newest;
+        // Modified Newest First
+        app.sort_mode = SortMode::ModifiedNewest;
         let indices = app.get_filtered_indices();
-        assert_eq!(app.all_entries[indices[0]].filename, "alpha.png"); // 5 secs ago
+        assert_eq!(app.all_entries[indices[0]].filename, "alpha.png"); // 1200.0
 
-        // Oldest First (largest secs_ago)
-        app.sort_mode = SortMode::Oldest;
+        // Modified Oldest First
+        app.sort_mode = SortMode::ModifiedOldest;
         let indices = app.get_filtered_indices();
-        assert_eq!(app.all_entries[indices[0]].filename, "zeta.png"); // 100 secs ago
+        assert_eq!(app.all_entries[indices[0]].filename, "zeta.png"); // 200.0
+
+        // Created Newest First
+        app.sort_mode = SortMode::CreatedNewest;
+        let indices = app.get_filtered_indices();
+        assert_eq!(app.all_entries[indices[0]].filename, "alpha.png"); // 1100.0
+
+        // Created Oldest First
+        app.sort_mode = SortMode::CreatedOldest;
+        let indices = app.get_filtered_indices();
+        assert_eq!(app.all_entries[indices[0]].filename, "zeta.png"); // 100.0
     }
 
     #[test]

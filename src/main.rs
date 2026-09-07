@@ -8,6 +8,7 @@ mod natural_sort;
 mod scanner;
 mod statx;
 mod watcher;
+mod zip_utils;
 
 use app::OmniViewApp;
 

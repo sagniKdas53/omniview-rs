@@ -158,6 +158,7 @@ impl OmniViewApp {
 
     pub fn rescan(&mut self) {
         let (records, _folders, _total_bytes) = scan_directory(&self.current_dir);
+        let _ = self.db.prune_missing_files(&self.current_dir.to_string_lossy());
         if !records.is_empty() {
             let _ = self.db.batch_sync_files(&records);
         }
@@ -198,6 +199,7 @@ impl OmniViewApp {
 
         std::thread::spawn(move || {
             use rayon::prelude::*;
+            let _ = db.prune_missing_files(&dir_str);
             let existing_subfolders = db.get_subfolders_with_counts(&dir_str).unwrap_or_default();
             if existing_subfolders.is_empty() {
                 let (records, _, _) = scan_directory(&dir);
@@ -361,7 +363,7 @@ impl OmniViewApp {
 
         // Ensure full high-res texture is loaded
         if self.viewer_texture.as_ref().map(|(p, _)| p != &entry.path).unwrap_or(true) {
-            if let Ok(dyn_img) = image::open(&entry.path) {
+            if let Some(dyn_img) = crate::cache::open_image_any(&entry.path) {
                 let rgba = dyn_img.to_rgba8();
                 let (w, h) = rgba.dimensions();
                 let color_image = ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_flat_samples().as_slice());

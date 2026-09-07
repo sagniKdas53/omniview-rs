@@ -5,9 +5,10 @@ use std::process::Command;
 
 pub fn format_file_uri<P: AsRef<Path>>(path: P) -> String {
     let p = path.as_ref();
-    let abs_path = match std::fs::canonicalize(p) {
+    let accessible = crate::zip_utils::ensure_accessible_path(p);
+    let abs_path = match std::fs::canonicalize(&accessible) {
         Ok(c) => c.to_string_lossy().to_string(),
-        Err(_) => p.to_string_lossy().to_string(),
+        Err(_) => accessible.to_string_lossy().to_string(),
     };
     format!("file://{}", abs_path)
 }
@@ -36,21 +37,24 @@ pub fn copy_files_uris<P: AsRef<Path>>(paths: &[P]) {
         return;
     }
 
-    let uri_list = format_uri_list(paths);
-    let path_bufs: Vec<PathBuf> = paths.iter().map(|p| p.as_ref().to_path_buf()).collect();
+    let resolved_paths: Vec<PathBuf> = paths
+        .iter()
+        .map(|p| crate::zip_utils::ensure_accessible_path(p.as_ref()))
+        .collect();
+
+    let uri_list = format_uri_list(&resolved_paths);
 
     // 1. Native file_list via arboard
     if let Ok(mut clip) = Clipboard::new() {
-        let _ = clip.set().file_list(&path_bufs);
+        let _ = clip.set().file_list(&resolved_paths);
     }
 
     // 2. Python PyQt5 helper: sets x-special/gnome-copied-files (for Dolphin/Nautilus) and text/uri-list
-    let abs_paths: Vec<String> = paths
+    let abs_paths: Vec<String> = resolved_paths
         .iter()
         .map(|p| {
-            let pref = p.as_ref();
-            std::fs::canonicalize(pref)
-                .unwrap_or_else(|_| pref.to_path_buf())
+            std::fs::canonicalize(p)
+                .unwrap_or_else(|_| p.clone())
                 .to_string_lossy()
                 .to_string()
         })
@@ -123,7 +127,15 @@ pub fn copy_multiple_paths<P: AsRef<Path>>(paths: &[P]) {
 }
 
 pub fn copy_image_bitmap<P: AsRef<Path>>(path: P) {
-    if let Ok(dyn_img) = image::open(path.as_ref()) {
+    let p = path.as_ref();
+    let img_res = if let Some((zip_path, inner_name)) = crate::zip_utils::parse_zip_path(p) {
+        crate::zip_utils::read_zip_entry_bytes(&zip_path, &inner_name)
+            .and_then(|bytes| image::load_from_memory(&bytes).ok())
+    } else {
+        image::open(p).ok()
+    };
+
+    if let Some(dyn_img) = img_res {
         let rgba = dyn_img.to_rgba8();
         let (w, h) = rgba.dimensions();
         let img_data = ImageData {
@@ -138,16 +150,22 @@ pub fn copy_image_bitmap<P: AsRef<Path>>(path: P) {
 }
 
 pub fn open_in_default_app<P: AsRef<Path>>(path: P) {
-    let _ = Command::new("xdg-open").arg(path.as_ref()).spawn();
+    let accessible = crate::zip_utils::ensure_accessible_path(path.as_ref());
+    let _ = Command::new("xdg-open").arg(accessible).spawn();
 }
 
 pub fn reveal_in_file_manager<P: AsRef<Path>>(path: P) {
     let p = path.as_ref();
-    let res = Command::new("dolphin").arg("--select").arg(p).spawn();
+    let target = if let Some((zip_path, _)) = crate::zip_utils::parse_zip_path(p) {
+        zip_path
+    } else {
+        p.to_path_buf()
+    };
+    let res = Command::new("dolphin").arg("--select").arg(&target).spawn();
     if res.is_err() {
-        let res2 = Command::new("nautilus").arg("--select").arg(p).spawn();
+        let res2 = Command::new("nautilus").arg("--select").arg(&target).spawn();
         if res2.is_err() {
-            if let Some(parent) = p.parent() {
+            if let Some(parent) = target.parent() {
                 let _ = Command::new("xdg-open").arg(parent).spawn();
             }
         }
@@ -204,9 +222,9 @@ pub fn start_drag_files<P: AsRef<Path>>(paths: &[P]) {
     let file_args: Vec<String> = paths
         .iter()
         .map(|p| {
-            let pref = p.as_ref();
-            std::fs::canonicalize(pref)
-                .unwrap_or_else(|_| pref.to_path_buf())
+            let accessible = crate::zip_utils::ensure_accessible_path(p.as_ref());
+            std::fs::canonicalize(&accessible)
+                .unwrap_or_else(|_| accessible)
                 .to_string_lossy()
                 .to_string()
         })

@@ -73,69 +73,79 @@ impl ThumbnailCache {
             }
         }
 
-        // 4. Generate WebP thumbnail on the fly
-        let dyn_img = image::open(source_path).ok()?;
-        let (orig_w, orig_h) = dyn_img.dimensions();
-        if orig_w == 0 || orig_h == 0 {
-            return None;
-        }
-
-        let resized = dyn_img.resize(max_size, max_size, FilterType::Triangle);
-        let rgba = resized.to_rgba8();
-        let (w, h) = rgba.dimensions();
-
-        let encoder = webp::Encoder::new(&rgba, webp::PixelLayout::Rgba, w, h);
-        let webp_data = encoder.encode(82.0);
-        let _ = fs::write(&cache_path, &*webp_data);
-
-        let color_image = ColorImage::from_rgba_unmultiplied(
-            [w as usize, h as usize],
-            rgba.as_flat_samples().as_slice(),
-        );
-
-        Some((orig_w, orig_h, color_image))
+    // 4. Generate WebP thumbnail on the fly
+    let dyn_img = open_image_any(source_path)?;
+    let (orig_w, orig_h) = dyn_img.dimensions();
+    if orig_w == 0 || orig_h == 0 {
+        return None;
     }
 
-    fn load_image_to_color_image<P: AsRef<Path>>(thumb_path: P) -> Option<(u32, u32, ColorImage)> {
-        let bytes = fs::read(thumb_path).ok()?;
-        let dyn_img = if let Ok(img) = image::load_from_memory_with_format(&bytes, image::ImageFormat::WebP) {
-            img
-        } else {
-            image::load_from_memory(&bytes).ok()?
-        };
-        let rgba = dyn_img.to_rgba8();
-        let (w, h) = rgba.dimensions();
-        let color_image = ColorImage::from_rgba_unmultiplied(
-            [w as usize, h as usize],
-            rgba.as_flat_samples().as_slice(),
-        );
-        Some((w, h, color_image))
-    }
+    let resized = dyn_img.resize(max_size, max_size, FilterType::Triangle);
+    let rgba = resized.to_rgba8();
+    let (w, h) = rgba.dimensions();
 
-    pub fn process_image_features<P: AsRef<Path>>(
-        &self,
-        source_path: P,
-        max_size: u32,
-    ) -> Option<(PathBuf, u32, u32, &'static str, &'static str, u8, u8, u8, String)> {
-        let source_path = source_path.as_ref();
-        let cache_path = self.get_canonical_thumb_path(source_path);
+    let encoder = webp::Encoder::new(&rgba, webp::PixelLayout::Rgba, w, h);
+    let webp_data = encoder.encode(82.0);
+    let _ = fs::write(&cache_path, &*webp_data);
 
-        if let Ok(dyn_img) = image::open(source_path) {
-            let (w, h, aspect, color_name, r, g, b, dhash) = extract_image_features(&dyn_img);
+    let color_image = ColorImage::from_rgba_unmultiplied(
+        [w as usize, h as usize],
+        rgba.as_flat_samples().as_slice(),
+    );
 
-            if !cache_path.exists() {
-                let resized = dyn_img.resize(max_size, max_size, FilterType::Triangle);
-                let rgba = resized.to_rgba8();
-                let (rw, rh) = rgba.dimensions();
-                let encoder = webp::Encoder::new(&rgba, webp::PixelLayout::Rgba, rw, rh);
-                let webp_data = encoder.encode(82.0);
-                let _ = fs::write(&cache_path, &*webp_data);
-            }
+    Some((orig_w, orig_h, color_image))
+}
 
-            return Some((cache_path, w, h, aspect, color_name, r, g, b, dhash));
+fn load_image_to_color_image<P: AsRef<Path>>(thumb_path: P) -> Option<(u32, u32, ColorImage)> {
+    let bytes = fs::read(thumb_path).ok()?;
+    let dyn_img = if let Ok(img) = image::load_from_memory_with_format(&bytes, image::ImageFormat::WebP) {
+        img
+    } else {
+        image::load_from_memory(&bytes).ok()?
+    };
+    let rgba = dyn_img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    let color_image = ColorImage::from_rgba_unmultiplied(
+        [w as usize, h as usize],
+        rgba.as_flat_samples().as_slice(),
+    );
+    Some((w, h, color_image))
+}
+
+pub fn process_image_features<P: AsRef<Path>>(
+    &self,
+    source_path: P,
+    max_size: u32,
+) -> Option<(PathBuf, u32, u32, &'static str, &'static str, u8, u8, u8, String)> {
+    let source_path = source_path.as_ref();
+    let cache_path = self.get_canonical_thumb_path(source_path);
+
+    if let Some(dyn_img) = open_image_any(source_path) {
+        let (w, h, aspect, color_name, r, g, b, dhash) = extract_image_features(&dyn_img);
+
+        if !cache_path.exists() {
+            let resized = dyn_img.resize(max_size, max_size, FilterType::Triangle);
+            let rgba = resized.to_rgba8();
+            let (rw, rh) = rgba.dimensions();
+            let encoder = webp::Encoder::new(&rgba, webp::PixelLayout::Rgba, rw, rh);
+            let webp_data = encoder.encode(82.0);
+            let _ = fs::write(&cache_path, &*webp_data);
         }
 
-        None
+        return Some((cache_path, w, h, aspect, color_name, r, g, b, dhash));
+    }
+
+    None
+}
+}
+
+pub fn open_image_any<P: AsRef<Path>>(path: P) -> Option<image::DynamicImage> {
+    let p = path.as_ref();
+    if let Some((zip_path, inner_name)) = crate::zip_utils::parse_zip_path(p) {
+        let bytes = crate::zip_utils::read_zip_entry_bytes(&zip_path, &inner_name)?;
+        image::load_from_memory(&bytes).ok()
+    } else {
+        image::open(p).ok()
     }
 }
 

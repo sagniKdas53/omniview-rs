@@ -200,6 +200,51 @@ impl Database {
         Ok(results)
     }
 
+    pub fn prune_missing_files(&self, root_dir: &str) -> Result<usize> {
+        let conn = self.get_connection()?;
+        let pattern = format!("{}/%", root_dir.trim_end_matches('/'));
+        let mut stmt = conn.prepare(
+            "SELECT path FROM images WHERE path = ?1 OR path LIKE ?2;",
+        )?;
+        let rows = stmt.query_map(params![root_dir, pattern], |row| {
+            row.get::<_, String>(0)
+        })?;
+
+        let mut to_delete = Vec::new();
+        for r in rows.flatten() {
+            let p = PathBuf::from(&r);
+            if let Some((zip_path, inner_name)) = crate::zip_utils::parse_zip_path(&p) {
+                if !zip_path.exists() {
+                    to_delete.push(r);
+                } else {
+                    let zip_stem = zip_path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+                    let zip_dir = zip_path.parent().unwrap_or(Path::new(""));
+                    if crate::zip_utils::is_raw_duplicate(zip_dir, zip_stem, &inner_name) {
+                        to_delete.push(r);
+                    }
+                }
+            } else if !p.exists() {
+                to_delete.push(r);
+            }
+        }
+
+        if to_delete.is_empty() {
+            return Ok(0);
+        }
+
+        let count = to_delete.len();
+        let mut del_conn = self.get_connection()?;
+        let tx = del_conn.transaction()?;
+        {
+            let mut del_stmt = tx.prepare("DELETE FROM images WHERE path = ?1;")?;
+            for path_str in &to_delete {
+                del_stmt.execute(params![path_str])?;
+            }
+        }
+        tx.commit()?;
+        Ok(count)
+    }
+
     #[allow(dead_code)]
     pub fn get_subfolders_with_counts(&self, root_dir: &str) -> Result<Vec<(String, usize)>> {
         let conn = self.get_connection()?;
